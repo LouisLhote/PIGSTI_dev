@@ -4241,17 +4241,10 @@ else:
             ),
             samples=" ".join(BIO_SAMPLES),
         shell:
+            # Indented <<'PY' heredocs keep leading spaces → Python IndentationError.
             r"""
-            python - <<'PY'
-            import os
-            import pandas as pd
-            samples = '''{params.samples}'''.split()
-            note = '''{params.note}'''
-            os.makedirs("results/final", exist_ok=True)
-            pd.DataFrame({{"sample": samples, "note": note}}).to_excel(
-                "{output.excel}", index=False
-            )
-            PY
+            mkdir -p results/final
+            python -c "import pandas as pd; s='''{params.samples}'''.split(); n='''{params.note}'''; pd.DataFrame({{'sample': s, 'note': n}}).to_excel('{output.excel}', index=False)"
             """
 
 # Generate per-sample PDF reports
