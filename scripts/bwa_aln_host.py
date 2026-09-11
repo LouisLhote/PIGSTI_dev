@@ -36,6 +36,7 @@ def _ensure_aligner_utils_path():
 
 _ensure_aligner_utils_path()
 from aligner_ref_utils import resolve_bowtie2_prefix_and_fasta, resolve_bwa_database_prefix
+from pigsti_verbosity import bash_stderr_redirect, bowtie2_quiet_args, vprint
 
 # Read species
 with open(species_file) as f:
@@ -108,7 +109,7 @@ def ensure_bowtie2_index(index_prefix: str, ref_fasta: str, timeout_sec: int = 3
             # We hold the lock: (re)build the index
             os.makedirs(os.path.dirname(index_prefix), exist_ok=True)
             build_cmd = f"bowtie2-build {ref_fasta} {index_prefix}"
-            print(f"[bwa_aln_host] Bowtie2 index not complete at {index_prefix}, building with:\n{build_cmd}")
+            vprint(config, f"[bwa_aln_host] Bowtie2 index not complete at {index_prefix}, building with:\n{build_cmd}")
             rc = os.system(build_cmd)
             if rc != 0:
                 # Best effort cleanup
@@ -210,11 +211,12 @@ if host_aligner == "bowtie2":
         "--rg",
         "PL:ILLUMINA",
     ]
+    bowtie2_cmd[1:1] = bowtie2_quiet_args(config)
     if lb:
         bowtie2_cmd.extend(["--rg", f"LB:{lb}"])
     if pathogen_mode != "default":
         bowtie2_cmd.extend(["--un-gz", host_unmapped_fastq])
-    print(f"Running bowtie2 -> samtools (log: {log_file})")
+    vprint(config, f"Running bowtie2 -> samtools (log: {log_file})")
     run_bowtie2_pipe_to_bam(bowtie2_cmd, log_file, threads, host_mapped_bam)
     if pathogen_mode == "default":
         subprocess.run(
@@ -231,13 +233,16 @@ if host_aligner == "bowtie2":
 else:
     # BWA host mapping (original behaviour)
     # We keep a single SAI file and reuse it
+    bwa_log = host_mapped_bam.replace(".bam", "_bwa.log")
+    err_redir = bash_stderr_redirect(bwa_log, config)
     sai_file = host_mapped_bam.replace(".bam", ".sai")
     if pathogen_mode == "default":
         # Fast mode: only produce host-mapped BAM; create empty placeholders for unaligned outputs
         cmd = (
-            f"bwa aln -l 1024 -n 0.01 -o 2 -t {threads} {index_prefix} {reads_file} > {sai_file} && "
+            f"mkdir -p \"$(dirname {bwa_log})\"; "
+            f"bwa aln -l 1024 -n 0.01 -o 2 -t {threads} {index_prefix} {reads_file} > {sai_file} {err_redir} && "
             f"bwa samse -r '@RG\\tID:{sample}_host\\tSM:{sample}\\tPL:ILLUMINA' "
-            f"{index_prefix} {sai_file} {reads_file} | "
+            f"{index_prefix} {sai_file} {reads_file} {err_redir} | "
             f"samtools view -@ {threads} -F 4 -b -o {host_mapped_bam} && "
             f': > "{host_unmapped_bam}" && '
             f'printf "" | pigz > "{host_unmapped_fastq}"'
@@ -245,18 +250,19 @@ else:
     else:
         # Super-careful mode: also produce host-unaligned BAM + FASTQ for pathogen mapping
         cmd = (
-            f"bwa aln -l 1024 -n 0.01 -o 2 -t {threads} {index_prefix} {reads_file} > {sai_file} && "
+            f"mkdir -p \"$(dirname {bwa_log})\"; "
+            f"bwa aln -l 1024 -n 0.01 -o 2 -t {threads} {index_prefix} {reads_file} > {sai_file} {err_redir} && "
             f"bwa samse -r '@RG\\tID:{sample}_host\\tSM:{sample}\\tPL:ILLUMINA' "
-            f"{index_prefix} {sai_file} {reads_file} | "
+            f"{index_prefix} {sai_file} {reads_file} {err_redir} | "
             f"samtools view -@ {threads} -F 4 -b -o {host_mapped_bam} && "
             f"bwa samse -r '@RG\\tID:{sample}_host\\tSM:{sample}\\tPL:ILLUMINA' "
-            f"{index_prefix} {sai_file} {reads_file} | "
+            f"{index_prefix} {sai_file} {reads_file} {err_redir} | "
             f"samtools view -@ {threads} -f 4 -b -o {host_unmapped_bam} && "
             f"samtools bam2fq {host_unmapped_bam} | pigz > {host_unmapped_fastq}"
         )
 
 if cmd is not None:
-    print(f"Running command:\n{cmd}")
+    vprint(config, f"Running command:\n{cmd}")
     try:
         subprocess.run(
             ["bash", "-c", f"set -euo pipefail; {cmd}"],

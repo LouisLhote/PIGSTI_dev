@@ -4,6 +4,16 @@ import subprocess
 import yaml
 
 
+def _ensure_scripts_path():
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+
+
+_ensure_scripts_path()
+from pigsti_verbosity import is_verbose
+
+
 def main():
     if "snakemake" not in globals():
         print("This script must be run by Snakemake.", file=sys.stderr)
@@ -191,9 +201,22 @@ def main():
         "-r", ref_path,
     ]
 
-    # Run and stream output to log if provided
-    with open(log_path, "a") if log_path else open(os.devnull, "w") as lf:
-        proc = subprocess.run(cmd, stdout=lf, stderr=lf)
+    # Quiet by default: tool stdout/stderr → log only.
+    # Verbose: tee tool output to console + log.
+    verbose_cfg = cfg if isinstance(cfg, dict) else getattr(snakemake, "config", {}) or {}
+    if is_verbose(verbose_cfg) and log_path:
+        with open(log_path, "a") as lf:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            )
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                sys.stderr.write(line)
+                lf.write(line)
+            proc.wait()
+    else:
+        with open(log_path, "a") if log_path else open(os.devnull, "w") as lf:
+            proc = subprocess.run(cmd, stdout=lf, stderr=lf)
     if proc.returncode != 0:
         print(f"DamageProfiler failed with exit code {proc.returncode}", file=sys.stderr)
         sys.exit(proc.returncode)

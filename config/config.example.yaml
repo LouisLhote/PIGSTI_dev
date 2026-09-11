@@ -60,20 +60,48 @@ host_index: "/path/to/refs/chimera"
 enable_hops: false
 # hops_malt_index: "/path/to/malt_db"
 # hops_resources: "/path/to/HOPS/Resources"
-# hops_heap_gb: 800
 # hops_parallel: true              # per-sample MALT (or mmap batch)
 # hops_malt_mmap: true             # single-node: page-cache + malt-run --memoryMode map
-# hops_parallel_jobs: 4
-# hops_threads_per_job: 10         # omit for auto (threadsMalt / hops_parallel_jobs)
+# Resource keys for HOPS: see --- Resources --- below (hops_heap_gb, hops_parallel_jobs, …)
 
 enable_decom: false
 # decOM_sources: "/path/to/decOM_sources"
-# decom_memory: "64GB"
-# decom_threads: 8
+# Resource keys for decOM: see --- Resources --- below (decom_memory; decom_threads auto)
 
 pathogen_screening_only: false   # true → skip host/mtDNA mapping & QC
+enable_trimming: true            # false → skip AdapterRemoval/cutadapt; use samples.tsv r1 as collapsed input
+enable_metagenomics: true        # false → skip KrakenUniq / E-value / HOPS / decOM (+ pathogen auth)
+enable_pathogen_authentication: true  # false → keep screening; skip pathogen mapping + auth reports
 enable_sexing: true              # residual method; Cow, Goat, Sheep, Dog only
+# Tool progress on the console (bwa / bowtie2). Default quiet → logs only.
+enable_verbose: false
 cleanup_intermediates: false
+
+# --- Resources ---
+# Thread sizing for markdup / summary / decOM:
+#   max_cores → prefer this key; else snakemake --cores; else 8
+#   markdup_threads = min(6, max_cores)   unless overridden below
+#   summary_threads = min(8, max_cores)   unless overridden
+#   decom_threads   = min(8, max_cores)   unless overridden
+# max_cores: 40
+# markdup_threads: 6
+# summary_threads: 8
+# decom_threads: 8
+
+# HOPS / MALT (only when enable_hops: true) — set these explicitly:
+hops_heap_gb: 800                # Java -Xmx per MALT/HOPS invocation (GB)
+hops_parallel_jobs: 2            # concurrent MALT jobs (mmap or per-sample)
+# hops_threads_per_job:          # OMIT for auto = threadsMalt / hops_parallel_jobs
+# hops_max_memory_malt_per_job:  # OMIT for auto = maxMemoryMalt / hops_parallel_jobs
+
+# decOM (only when enable_decom: true):
+# Approx RAM budget ≈ decom_memory × decom_threads (decom_threads auto from max_cores).
+decom_memory: "64GB"
+
+# Hardcoded today (not config keys):
+#   Qualimap --java-mem-size=9G
+#   DamageProfiler -Xmx12G
+#   Many rules use fixed threads 4–8 (AdapterRemoval 6, KrakenUniq 8, FastQ Screen 4, …)
 
 # Edit-distance damage split is always on in the pipeline.
 # edit_distance_damage_window_size: 5

@@ -66,7 +66,7 @@ python scripts/validate_pigsti_setup.py --config config/config.yaml --samples co
 
 | File | Required columns / content |
 |------|----------------------------|
-| **`config/samples.tsv`** | Tab-separated. **`sample`** (bio ID), **`pcr`** (library ID; optional — defaults to `sample`), **`r1`** (and **`r2`** if paired-end). Paths must exist on disk. Optional: `RGLB`, `sequencing_run`, `source` (`LOCAL` / `ENA` metadata only). |
+| **`config/samples.tsv`** | Tab-separated. **`sample`** (bio ID), **`pcr`** (library ID; optional — defaults to `sample`), **`r1`** (and **`r2`** if paired-end). Paths must exist on disk. Optional metadata: `RGLB`, `sequencing_run`, `source` (`LOCAL` / `ENA`). Optional per-library flags (blank = inherit config / FastQ Screen): **`skip_trimming`**, **`skip_metagenomics`** (alias `skip_meta`), **`skip_pathogen_authentication`** (aliases `skip_pathogen` / `skip_pathogen_auth`), **`force_host_species`** (must match a key in `bwa_indices` / `bowtie2_indices`; FastQ Screen still runs for QC). |
 | **`config/Pathogen_spreadsheet.csv`** | **`Krakenuniq name`**, **`Hops name`**, **`bwa index`** (pathogen reference FASTA or index path). One row per pathogen you may map. |
 | **`config/config.yaml`** | See mandatory keys below. |
 
@@ -95,11 +95,54 @@ Pathogen reference FASTAs for **mapping** come from the spreadsheet `bwa index` 
 | `pathogen_aligner` | `bwa` | `bwa` or `bowtie2` for pathogen reference mapping. |
 | `host_aligner` | `bwa` | `bwa` or `bowtie2` for host/mtDNA. |
 | `pathogen_screening_only` | `false` | `true` skips host/mtDNA and forces `pathogen_mapping_mode: default`. |
+| `enable_trimming` | `true` | `false` skips AdapterRemoval/cutadapt and stages `samples.tsv` **r1** as `…/adapter_removal/{pcr}.collapsed.gz` (r2 ignored). Prefer already-collapsed / pre-trimmed FASTQs in r1. |
+| `enable_metagenomics` | `true` | `false` skips KrakenUniq, E-value screening, abundance matrices, HOPS, and decOM. Also forces `enable_pathogen_authentication: false`. |
+| `enable_pathogen_authentication` | `true` | `false` keeps metagenomics screening but skips pathogen reference mapping, authentication metrics, and pathogen summary reports. |
+| `enable_verbose` | `false` | `true` prints bwa/bowtie2 progress to the console; default keeps tools quiet (stderr → log files; bowtie2 `--quiet`). |
 | `strict_inputs` | `true` | Fail fast on empty/missing critical inputs. |
 | `adapter_removal_qualitymax` | `41` | AdapterRemoval `--qualitymax` (Phred+33). Raise (e.g. `50`) if FASTQs exceed Q41 (NovaSeq / some SRA). |
 | `fastq_screen_full_dataset_rescreen` | `true` | If best species `#One_hit_one_genome` on the default subset is below the threshold, re-run FastQ Screen with `--subset 0` (full collapsed FASTQ). |
 | `fastq_screen_full_dataset_min_one_hit` | `50` | Minimum `#One_hit_one_genome` reads on the subset pass before triggering a full-dataset re-screen. |
 | `enable_sexing` | `true` | Run chromosome-residual sexing after host mapping (requires `pathogen_screening_only: false`). |
+
+### Per-library sample-sheet overrides
+
+Optional — **omit the columns entirely for a normal full run** (same as blank / FALSE). Only add them when a mixed cohort needs per-library exceptions (TRUE/yes/1):
+
+| Column | Effect when set |
+|--------|-----------------|
+| `skip_trimming` | Stage `r1` as collapsed.gz (skip AdapterRemoval/cutadapt for that library) |
+| `skip_metagenomics` / `skip_meta` | Skip PRINSEQ → Kraken/E-value (± HOPS/decOM) for that library |
+| `skip_pathogen_authentication` / `skip_pathogen` | Skip pathogen mapping/auth for that bio when its libraries skip |
+| `force_host_species` | Force host/mtDNA index key (e.g. `Pig`). FastQ Screen still runs; `…_best_species.txt` overwritten |
+
+### Stage targets (Snakemake)
+
+Default `snakemake` / `snakemake all` respects YAML `enable_*` flags. Named targets select stages without rewriting config:
+
+```bash
+snakemake host_only            # trim → host/mtDNA QC
+snakemake metagenomics_only    # screening only (no host, no pathogen auth)
+snakemake pathogen_auth        # screening + pathogen authentication
+snakemake preflight            # write results/workflow/preflight_report.txt
+python scripts/pigsti_preflight.py --config config/config.yaml
+```
+
+### Resources
+
+| Key | Default | Notes |
+|-----|---------|--------|
+| `max_cores` | **omit → `snakemake --cores`**, else `8` | Budget for auto thread sizing |
+| `markdup_threads` | **omit → `min(6, max_cores)`** | Override only if needed |
+| `summary_threads` | **omit → `min(8, max_cores)`** | Override only if needed |
+| `decom_threads` | **omit → `min(8, max_cores)`** | Override only if needed |
+| `hops_heap_gb` | `800` | `enable_hops` — Java `-Xmx` per MALT/HOPS (GB) |
+| `hops_parallel_jobs` | `2` | `enable_hops` + parallel MALT |
+| `hops_threads_per_job` | **omit → auto** `threadsMalt / hops_parallel_jobs` | |
+| `hops_max_memory_malt_per_job` | **omit → auto** `maxMemoryMalt / hops_parallel_jobs` | |
+| `decom_memory` | `"64GB"` | `enable_decom` — per Dask worker; RAM ≈ mem × `decom_threads` |
+
+Hardcoded (not YAML yet): Qualimap `9G`, DamageProfiler `12G`, many rules `threads: 4–8`.
 
 Each library writes `results/libraries/{pcr}/fastq_screen/{pcr}_fastq_screen_run_mode.txt` (`pass=subset_default` or `pass=full_dataset`).
 
@@ -244,6 +287,10 @@ mtDNA_indices:
 
 enable_hops: false
 enable_decom: false
+enable_trimming: true
+enable_metagenomics: true
+enable_pathogen_authentication: true
+enable_verbose: false
 pathogen_screening_only: false
 
 pathogen_detection_criteria:

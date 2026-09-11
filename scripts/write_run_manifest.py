@@ -59,6 +59,11 @@ def load_effective_config(path: str) -> dict:
         "enable_hops",
         "enable_decom",
         "enable_diamond",
+        "enable_trimming",
+        "enable_metagenomics",
+        "enable_pathogen_authentication",
+        "enable_verbose",
+        "pathogen_screening_only",
         "strict_inputs",
         "dedup_tool",
         "merge_tool",
@@ -66,6 +71,7 @@ def load_effective_config(path: str) -> dict:
         "pathogen_detection_criteria",
         "edit_distance_damage_split",
         "edit_distance_damage_window_size",
+        "adapter_removal_qualitymax",
         "cleanup_intermediates",
     ]
     return {k: cfg[k] for k in keys if k in cfg}

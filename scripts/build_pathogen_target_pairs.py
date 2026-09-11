@@ -258,7 +258,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config/config.yaml")
     parser.add_argument("--spreadsheet", default="config/Pathogen_spreadsheet.csv")
-    parser.add_argument("--bio-samples", nargs="+", required=True)
+    parser.add_argument("--bio-samples", nargs="*", default=[], required=False)
     parser.add_argument(
         "--evalue",
         "--escore",

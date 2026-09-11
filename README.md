@@ -251,9 +251,17 @@ Screening uses KrakenUniq clade read count (default **≥ 50**) and Guellil **E-
 |------|--------|
 | `enable_hops: true` | HOPS (MALT + MaltExtract); candidates = E-value hits ∪ HOPS hits. Supports `hops_parallel` / `hops_malt_mmap` |
 | `enable_decom: true` | decOM source tracking |
+| `enable_trimming: false` | Skip AdapterRemoval/cutadapt; use `samples.tsv` r1 as collapsed input (r2 ignored) |
+| `enable_metagenomics: false` | Skip KrakenUniq / E-value / HOPS / decOM (also disables pathogen authentication) |
+| `enable_pathogen_authentication: false` | Keep metagenomics screening; skip pathogen mapping + authentication reports |
+| `enable_verbose: true` | Show bwa/bowtie2 progress on the console (default is quiet → log files) |
 | `enable_sexing: true` | Residual sexing (Cow, Goat, Sheep, Dog) |
 | `pathogen_screening_only: true` | Skip host/mtDNA mapping |
 | `cleanup_intermediates: true` | Drop large intermediates after finals |
+
+Optional **`samples.tsv` columns**: `skip_trimming`, `skip_metagenomics`, `skip_pathogen_authentication`, `force_host_species` (see [`docs/CONFIG.md`](docs/CONFIG.md)).
+
+Stage targets: `snakemake host_only` · `metagenomics_only` · `pathogen_auth` · `preflight` (default `all` follows config).
 
 ---
 

@@ -350,6 +350,15 @@ input:focus, select:focus {
     </div>
     <span class="section-num">TRIM</span>
   </div>
+  <div class="toggle-group" style="margin-bottom:14px;border-bottom:1px solid #e8f0ec;">
+    <div class="toggle-item">
+      <label class="toggle-info" for="enable_trimming">
+        <div class="toggle-title">Run adapter trimming</div>
+        <div class="toggle-desc">Off → skip AdapterRemoval/cutadapt and use samples.tsv <code>r1</code> as collapsed input (<code>r2</code> ignored)</div>
+      </label>
+      <label class="switch"><input type="checkbox" id="enable_trimming" checked><span class="slider"></span></label>
+    </div>
+  </div>
   <div class="subhead">AdapterRemoval · paired-end</div>
   <div class="field-row">
     <div class="field">
@@ -360,6 +369,11 @@ input:focus, select:focus {
       <div class="field-label"><label>Adapter 2 (read 2)</label><span class="tag tag-opt">optional</span></div>
       <input type="text" id="ar_adapter2" placeholder="AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT" class="mono">
     </div>
+  </div>
+  <div class="field" style="margin-top:10px;max-width:280px;">
+    <div class="field-label"><label>Quality max (Phred+33)</label><span class="tag tag-opt">optional</span></div>
+    <div class="hint">AdapterRemoval <code>--qualitymax</code> (default 41; raise e.g. to 50 for NovaSeq / some SRA)</div>
+    <input type="text" id="adapter_removal_qualitymax" value="41">
   </div>
   <div class="subhead">cutadapt · single-end</div>
   <div class="field">
@@ -487,11 +501,27 @@ input:focus, select:focus {
     <div class="section-icon icon-amber">06</div>
     <div>
       <h2>Pipeline modules</h2>
-      <div class="desc">Optional analyses — edit-distance damage split always runs</div>
+      <div class="desc">Optional analyses and stage skips — edit-distance damage split always runs when pathogen auth is on</div>
     </div>
     <span class="section-num">MODULES</span>
   </div>
   <div class="toggle-group">
+    <div class="toggle-item">
+      <label class="toggle-info" for="enable_metagenomics">
+        <div class="toggle-title">Metagenomics screening</div>
+        <div class="toggle-desc">KrakenUniq, E-value, abundance matrices · Off also disables HOPS, decOM, and pathogen authentication</div>
+      </label>
+      <label class="switch"><input type="checkbox" id="enable_metagenomics" checked><span class="slider"></span></label>
+    </div>
+
+    <div class="toggle-item">
+      <label class="toggle-info" for="enable_pathogen_authentication">
+        <div class="toggle-title">Pathogen authentication</div>
+        <div class="toggle-desc">Pathogen reference mapping + authentication metrics/reports · Off keeps screening only</div>
+      </label>
+      <label class="switch"><input type="checkbox" id="enable_pathogen_authentication" checked><span class="slider"></span></label>
+    </div>
+
     <div class="toggle-item">
       <label class="toggle-info" for="enable_hops">
         <div class="toggle-title">HOPS</div>
@@ -545,9 +575,9 @@ input:focus, select:focus {
     <div class="toggle-extra" id="decom-extra">
       <div class="field"><div class="field-label"><label>decOM sources</label></div><input type="text" id="decOM_sources" placeholder="/path/to/decOM_sources" class="mono"></div>
       <div class="field-row">
-        <div class="field"><div class="field-label"><label>Memory</label></div><input type="text" id="decom_memory" value="64GB"></div>
-        <div class="field"><div class="field-label"><label>Threads</label></div><input type="text" id="decom_threads" value="8"></div>
+        <div class="field"><div class="field-label"><label>Memory</label></div><div class="hint">Per Dask worker; RAM ≈ mem × auto decom_threads</div><input type="text" id="decom_memory" value="64GB"></div>
       </div>
+      <div class="field"><div class="field-label"><label>Max cores (optional)</label></div><div class="hint">Sizes markdup / summary / decom threads as min(cap, max_cores). Blank → snakemake --cores</div><input type="text" id="max_cores" placeholder="e.g. 40"></div>
     </div>
 
     <div class="toggle-item">
@@ -564,6 +594,14 @@ input:focus, select:focus {
         <div class="toggle-desc">Skip host / mtDNA mapping and QC</div>
       </label>
       <label class="switch"><input type="checkbox" id="pathogen_screening_only"><span class="slider"></span></label>
+    </div>
+
+    <div class="toggle-item">
+      <label class="toggle-info" for="enable_verbose">
+        <div class="toggle-title">Verbose tool output</div>
+        <div class="toggle-desc">Show bwa / bowtie2 progress on the console · Off (default) keeps tools quiet (logs only)</div>
+      </label>
+      <label class="switch"><input type="checkbox" id="enable_verbose"><span class="slider"></span></label>
     </div>
 
     <div class="toggle-item">
@@ -710,14 +748,15 @@ function generate() {
   y += 'samples: "'+val('samples')+'"\n';
   y += 'pathogen_spreadsheet: "'+val('pathogen_spreadsheet')+'"\n\n';
 
-  var a1=val('ar_adapter1'), a2=val('ar_adapter2'), ca=val('cutadapt_adapter');
-  if (a1||a2||ca) {
-    y += '# ── Adapter trimming ─────────────────────────────────────────\n';
-    if (a1) y += 'adapter_removal_adapter1: "'+a1+'"\n';
-    if (a2) y += 'adapter_removal_adapter2: "'+a2+'"\n';
-    if (ca) y += 'cutadapt_adapter: "'+ca+'"\n';
-    y += '\n';
-  }
+  var a1=val('ar_adapter1'), a2=val('ar_adapter2'), ca=val('cutadapt_adapter'), qmax=val('adapter_removal_qualitymax');
+  y += '# ── Adapter trimming ─────────────────────────────────────────\n';
+  y += 'enable_trimming: '+chk('enable_trimming')+'\n';
+  if (a1) y += 'adapter_removal_adapter1: "'+a1+'"\n';
+  if (a2) y += 'adapter_removal_adapter2: "'+a2+'"\n';
+  if (qmax && qmax !== '41') y += 'adapter_removal_qualitymax: '+qmax+'\n';
+  else if (qmax) y += 'adapter_removal_qualitymax: '+qmax+'\n';
+  if (ca) y += 'cutadapt_adapter: "'+ca+'"\n';
+  y += '\n';
 
   y += '# ── Alignment ───────────────────────────────────────────────\n';
   y += 'host_aligner: '+val('host_aligner')+'\n';
@@ -745,8 +784,12 @@ function generate() {
   y += '\n';
 
   y += '# ── Pipeline modules ────────────────────────────────────────\n';
-  y += 'enable_hops: '+chk('enable_hops')+'\n';
-  if (chk('enable_hops')) {
+  var metaOn = chk('enable_metagenomics');
+  var pathAuth = metaOn && chk('enable_pathogen_authentication');
+  y += 'enable_metagenomics: '+metaOn+'\n';
+  y += 'enable_pathogen_authentication: '+pathAuth+'\n';
+  y += 'enable_hops: '+(metaOn && chk('enable_hops'))+'\n';
+  if (metaOn && chk('enable_hops')) {
     if (val('hops_malt_index')) y += 'hops_malt_index: "'+val('hops_malt_index')+'"\n';
     if (val('hops_resources')) y += 'hops_resources: "'+val('hops_resources')+'"\n';
     if (val('hops_heap_gb')) y += 'hops_heap_gb: '+val('hops_heap_gb')+'\n';
@@ -757,17 +800,22 @@ function generate() {
       if (val('hops_threads_per_job')) y += 'hops_threads_per_job: '+val('hops_threads_per_job')+'\n';
     }
   }
-  y += 'enable_decom: '+chk('enable_decom')+'\n';
-  if (chk('enable_decom')) {
+  y += 'enable_decom: '+(metaOn && chk('enable_decom'))+'\n';
+  if (metaOn && chk('enable_decom')) {
     if (val('decOM_sources')) y += 'decOM_sources: "'+val('decOM_sources')+'"\n';
     if (val('decom_memory')) y += 'decom_memory: "'+val('decom_memory')+'"\n';
-    if (val('decom_threads')) y += 'decom_threads: '+val('decom_threads')+'\n';
   }
   y += 'pathogen_screening_only: '+chk('pathogen_screening_only')+'\n';
   y += 'enable_sexing: '+chk('enable_sexing')+'\n';
+  y += 'enable_verbose: '+chk('enable_verbose')+'\n';
   y += 'cleanup_intermediates: '+chk('cleanup_intermediates')+'\n';
   y += '# edit-distance damage split is always enabled in the pipeline\n';
   y += 'edit_distance_damage_window_size: '+val('edit_distance_damage_window')+'\n\n';
+
+  y += '# ── Resources ───────────────────────────────────────────────\n';
+  y += '# markdup/summary/decom threads = min(cap, max_cores); omit max_cores → snakemake --cores\n';
+  if (val('max_cores')) y += 'max_cores: '+val('max_cores')+'\n';
+  y += '\n';
 
   y += '# ── Pathogen detection criteria ──────────────────────────────\n';
   y += 'pathogen_detection_criteria:\n';

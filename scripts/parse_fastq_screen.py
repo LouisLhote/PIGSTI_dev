@@ -164,6 +164,11 @@ def main_cli():
         action="store_true",
         help="Exit 1 when best #One_hit_one_genome is below --min-one-hit (for Snakemake shell)",
     )
+    parser.add_argument(
+        "--force-host-species",
+        default="",
+        help="Override FastQ Screen best species (must match a configured host index key)",
+    )
     args = parser.parse_args()
 
     screen_txt = args.screen_txt_flag or args.screen_txt
@@ -204,8 +209,17 @@ def main_cli():
     for msg in result["warnings"]:
         write_warning(warning_file, f"Warning: {msg}" if not msg.startswith("Warning") else msg)
 
+    chosen = result["best_species"]
+    force = (args.force_host_species or "").strip()
+    if force:
+        write_warning(
+            warning_file,
+            f"force_host_species={force!r} overrides FastQ Screen best={chosen!r}",
+        )
+        chosen = force
+
     with open(output_file, "w", encoding="utf-8") as f_out:
-        f_out.write(result["best_species"] + "\n")
+        f_out.write(chosen + "\n")
     return 0
 
 
@@ -233,7 +247,16 @@ if __name__ == "__main__":
             prefixed = msg if msg.startswith("Warning") or msg.startswith("Human") else f"Warning: {msg}"
             write_warning(warning_file, prefixed.replace("Warning: Warning:", "Warning:"))
 
+        force = str(snakemake.params.get("force_host_species") or "").strip()
+        chosen = result["best_species"]
+        if force:
+            write_warning(
+                warning_file,
+                f"force_host_species={force!r} overrides FastQ Screen best={chosen!r}",
+            )
+            chosen = force
+
         with open(output_file, "w", encoding="utf-8") as f_out:
-            f_out.write(result["best_species"] + "\n")
+            f_out.write(chosen + "\n")
     else:
         raise SystemExit(main_cli())

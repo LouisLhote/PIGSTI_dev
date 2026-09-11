@@ -1,7 +1,5 @@
 configfile: "config/config.yaml"
 
-ruleorder: adapter_removal_pe > adapter_removal_se
-
 global_wildcard_constraints = {
     "krakenuniq_name": r"[A-Za-z0-9_.-]+",
     "sample": r"[A-Za-z0-9_.-]+",
@@ -133,10 +131,41 @@ RESULTS_ROOT = setup_results_root(CFG)
 # Duplicate / merge tool configuration
 # - dedup_tool:  "picard" (default) or "samtools"
 # - merge_tool:  "picard" (default) or "samtools"
-# - markdup_threads: threads to use for duplicate marking (default: 6 for samtools)
+# Thread knobs (markdup / summary / decom) scale from max core budget unless overridden.
 DEDUP_TOOL = CFG.get("dedup_tool", "picard")
 MERGE_TOOL = CFG.get("merge_tool", "picard")
-MARKDUP_THREADS = int(CFG.get("markdup_threads", 6))
+
+
+def _resolve_max_cores(cfg: dict) -> int:
+    """
+    Max core budget for auto thread sizing.
+    Prefer config ``max_cores``, else Snakemake ``--cores`` (workflow.cores), else 8.
+    """
+    raw = cfg.get("max_cores", None)
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            pass
+    try:
+        cores = getattr(workflow, "cores", None)
+        if cores is not None:
+            return max(1, int(cores))
+    except NameError:
+        pass
+    return 8
+
+
+def _threads_from_max_cores(cfg: dict, key: str, soft_cap: int, max_cores: int) -> int:
+    """Explicit YAML override if set; else ``min(soft_cap, max_cores)``."""
+    raw = cfg.get(key, None)
+    if raw is not None and str(raw).strip() != "":
+        return max(1, int(raw))
+    return max(1, min(int(soft_cap), int(max_cores)))
+
+
+MAX_CORES = _resolve_max_cores(CFG)
+MARKDUP_THREADS = _threads_from_max_cores(CFG, "markdup_threads", 6, MAX_CORES)
 
 # FastQ Screen / Picard always come from the rule conda env (PATH), not config paths.
 FASTQ_SCREEN_EXE = "fastq_screen"
@@ -207,6 +236,23 @@ with open(SAMPLES_TSV) as f:
                 # ENA-derived rows written by ena_to_pigsti_samplesheet.py
                 # will have source == "ENA".
                 source = "LOCAL"
+            def _tsv_flag(*keys):
+                """Optional samples.tsv boolean: TRUE/yes/1 (blank → False)."""
+                for k in keys:
+                    if k not in row:
+                        continue
+                    raw = row.get(k)
+                    if raw is None:
+                        continue
+                    s = str(raw).strip().lower()
+                    if not s:
+                        continue
+                    if s in {"1", "true", "yes", "y", "t"}:
+                        return True
+                    if s in {"0", "false", "no", "n", "f"}:
+                        return False
+                return False
+
             PCR_INFO[pcr_id] = {
                 "sample": sample,
                 "r1": r1,
@@ -214,6 +260,19 @@ with open(SAMPLES_TSV) as f:
                 "RGLB": row.get("RGLB", ""),
                 "sequencing_run": row.get("sequencing_run", ""),
                 "source": source,
+                # Optional per-library overrides (blank = inherit config / FastQ Screen).
+                "skip_trimming": _tsv_flag("skip_trimming"),
+                "skip_metagenomics": _tsv_flag("skip_metagenomics", "skip_meta"),
+                "skip_pathogen_authentication": _tsv_flag(
+                    "skip_pathogen_authentication", "skip_pathogen", "skip_pathogen_auth"
+                ),
+                # Force host/mtDNA index species (must match a key in bwa_indices / bowtie2_indices).
+                # FastQ Screen still runs for QC; alignment uses this value when set.
+                "force_host_species": (
+                    str(row.get("force_host_species") or "").strip()
+                    if row.get("force_host_species") is not None
+                    else ""
+                ),
             }
             PCRS.append(pcr_id)
             SAMPLE_TO_PCRS[sample].append(pcr_id)
@@ -306,14 +365,20 @@ def hops_staged_rma_path(bio: str) -> str:
     return f"{HOPS_RMA_ROOT}/{bio}_unaligned.rma6"
 
 
-# Host/mtDNA summary parallelism (avoid threads: 999 on shared clusters)
-SUMMARY_THREADS = int(CFG.get("summary_threads", 8))
+# Host/mtDNA summary + decOM threads: auto from max_cores unless overridden in YAML.
+SUMMARY_THREADS = _threads_from_max_cores(CFG, "summary_threads", 8, MAX_CORES)
 
 # decOM: default False matches legacy ``decOM ... || true`` (pipeline continues on tool failure).
 DECOM_FAIL_ON_ERROR = bool(CFG.get("decom_fail_on_error", False))
 # decOM allocates approximately (decom_memory × decom_threads) RAM (legacy PIGSTI: 64GB × 8).
 DECOM_MEMORY = str(CFG.get("decom_memory", "64GB"))
-DECOM_THREADS = int(CFG.get("decom_threads", 8))
+DECOM_THREADS = _threads_from_max_cores(CFG, "decom_threads", 8, MAX_CORES)
+
+print(
+    f"[PIGSTI] max_cores={MAX_CORES} → markdup_threads={MARKDUP_THREADS}, "
+    f"summary_threads={SUMMARY_THREADS}, decom_threads={DECOM_THREADS}",
+    file=sys.stderr,
+)
 
 # Edit-distance damage-vs-no-damage split (HOPS-like) — always enabled.
 EDIT_DISTANCE_DAMAGE_SPLIT = True
@@ -338,6 +403,116 @@ ENABLE_DECOM = CFG.get("enable_decom", False)
 # Pathogen screening only (skip host/mtDNA alignment, qualimap, damage, and host summaries)
 PATHOGEN_SCREENING_ONLY = CFG.get("pathogen_screening_only", False)
 HOST_MTDNA_ANALYSIS_ENABLED = not PATHOGEN_SCREENING_ONLY
+
+# Modular skips (enable_* matches enable_hops / enable_decom / enable_sexing)
+# - enable_trimming=false: skip AdapterRemoval/cutadapt; stage R1 as collapsed.gz
+# - enable_metagenomics=false: skip KrakenUniq, E-value, abundance, HOPS, decOM, and pathogen auth
+# - enable_pathogen_authentication=false: keep metagenomics screening; skip pathogen mapping + auth reports
+ENABLE_TRIMMING = bool(CFG.get("enable_trimming", True))
+ENABLE_METAGENOMICS = bool(CFG.get("enable_metagenomics", True))
+ENABLE_PATHOGEN_AUTHENTICATION = bool(CFG.get("enable_pathogen_authentication", True))
+if not ENABLE_METAGENOMICS:
+    if CFG.get("enable_pathogen_authentication", True):
+        print(
+            "[PIGSTI] enable_metagenomics=false → forcing enable_pathogen_authentication=false",
+            file=sys.stderr,
+        )
+    ENABLE_PATHOGEN_AUTHENTICATION = False
+    if ENABLE_HOPS or ENABLE_DECOM:
+        print(
+            "[PIGSTI] enable_metagenomics=false → disabling HOPS/decOM targets",
+            file=sys.stderr,
+        )
+    ENABLE_HOPS = False
+    ENABLE_DECOM = False
+if not ENABLE_TRIMMING:
+    print(
+        "[PIGSTI] enable_trimming=false → staging input R1 as collapsed.gz "
+        "(AdapterRemoval/cutadapt skipped; PE R2 ignored)",
+        file=sys.stderr,
+    )
+
+# Per-library skip columns (samples.tsv) ∩ global enable_* flags
+SKIP_TRIM_PCRS = [
+    s for s in SAMPLES
+    if (not ENABLE_TRIMMING) or PCR_INFO[s].get("skip_trimming")
+]
+TRIM_PCRS = [s for s in SAMPLES if s not in set(SKIP_TRIM_PCRS)]
+TRIM_PE_PCRS = [s for s in TRIM_PCRS if SAMPLES_DICT[s]["r2"]]
+TRIM_SE_PCRS = [s for s in TRIM_PCRS if not SAMPLES_DICT[s]["r2"]]
+
+META_PCRS = [
+    s for s in SAMPLES
+    if ENABLE_METAGENOMICS and not PCR_INFO[s].get("skip_metagenomics")
+]
+META_BIOS = [
+    b for b in BIO_SAMPLES
+    if any(p in META_PCRS for p in SAMPLE_TO_PCRS[b])
+]
+AUTH_BIOS = [
+    b for b in META_BIOS
+    if ENABLE_PATHOGEN_AUTHENTICATION
+    and any(
+        not PCR_INFO[p].get("skip_pathogen_authentication")
+        for p in SAMPLE_TO_PCRS[b]
+    )
+]
+
+if SKIP_TRIM_PCRS and TRIM_PCRS:
+    print(
+        f"[PIGSTI] Per-library skip_trimming: {len(SKIP_TRIM_PCRS)} library(ies) "
+        f"(trim {len(TRIM_PCRS)})",
+        file=sys.stderr,
+    )
+elif SKIP_TRIM_PCRS:
+    print(
+        f"[PIGSTI] All {len(SKIP_TRIM_PCRS)} libraries skip trimming "
+        "(stage R1 as collapsed.gz)",
+        file=sys.stderr,
+    )
+if ENABLE_METAGENOMICS and len(META_BIOS) < len(BIO_SAMPLES):
+    print(
+        f"[PIGSTI] Per-library skip_metagenomics: metagenomics for "
+        f"{len(META_BIOS)}/{len(BIO_SAMPLES)} biological sample(s)",
+        file=sys.stderr,
+    )
+if ENABLE_PATHOGEN_AUTHENTICATION and len(AUTH_BIOS) < len(META_BIOS):
+    print(
+        f"[PIGSTI] Per-library skip_pathogen: authentication for "
+        f"{len(AUTH_BIOS)}/{len(META_BIOS)} screened sample(s)",
+        file=sys.stderr,
+    )
+_forced = [s for s in SAMPLES if PCR_INFO[s].get("force_host_species")]
+if _forced:
+    print(
+        f"[PIGSTI] force_host_species set for {len(_forced)} library(ies) "
+        "(FastQ Screen still runs; alignment uses forced species)",
+        file=sys.stderr,
+    )
+
+# Mixed PE/SE/skip producers for the same collapsed.gz path
+ruleorder: adapter_removal_pe > adapter_removal_se > stage_pretrimmed_as_collapsed
+
+
+def _wc_alt(ids):
+    """Alternation for wildcard_constraints; never-match if empty."""
+    if not ids:
+        return r"(?!x)x"
+    return "|".join(re.escape(x) for x in ids)
+
+
+# Tool console verbosity (default quiet). Shared helpers: scripts/pigsti_verbosity.py
+ENABLE_VERBOSE = bool(CFG.get("enable_verbose", False))
+BT2_QUIET_ARG = "" if ENABLE_VERBOSE else "--quiet"
+PICARD_QUIET_ARG = "" if ENABLE_VERBOSE else "QUIET=true"
+VERBOSE_FLAG = "true" if ENABLE_VERBOSE else "false"
+
+
+def tool_stderr_redirect(log_expr: str = "{log}") -> str:
+    """Bash stderr redirect for shell recipes (quiet → log only; verbose → tee)."""
+    if ENABLE_VERBOSE:
+        return f"2> >(tee -a {log_expr} >&2)"
+    return f"2>> {log_expr}"
 
 # In screening-only mode we rely on Bowtie2-based "host unaligned FASTQ" generation
 # (via rules like `bowtie2_unaligned` -> `sample_unaligned_fastq_by_type`).
@@ -533,7 +708,7 @@ def get_sample_ref_pairs(evalue_paths=None, hops_path=None, strict_cohort=False)
     if evalue_paths is None:
         evalue_paths = [
             f"results/pathogen/{s}/evalue/pathogen/{s}_pathogen.csv"
-            for s in BIO_SAMPLES
+            for s in AUTH_BIOS
             if os.path.isfile(f"results/pathogen/{s}/evalue/pathogen/{s}_pathogen.csv")
         ]
         if hops_path is None and ENABLE_HOPS:
@@ -545,7 +720,7 @@ def get_sample_ref_pairs(evalue_paths=None, hops_path=None, strict_cohort=False)
 
     return compute_pairs(
         evalue_paths,
-        list(BIO_SAMPLES),
+        list(AUTH_BIOS),
         spreadsheet_df,
         detection_cfg,
         hops_path=hops_path,
@@ -801,8 +976,9 @@ def get_cleanup_markers():
     if not CLEANUP_ENABLED:
         return []
     markers = []
-    # Prinseq cleanup
-    markers.extend([f"results/libraries/{pcr}/prinseq/.cleanup_done" for pcr in SAMPLES])
+    # Prinseq cleanup (metagenomics branch)
+    if ENABLE_METAGENOMICS:
+        markers.extend([f"results/libraries/{pcr}/prinseq/.cleanup_done" for pcr in META_PCRS])
     # Host cleanup (only when host/mtDNA analysis is enabled)
     if HOST_MTDNA_ANALYSIS_ENABLED:
         markers.extend([f"results/libraries/{pcr}/host_mapping/.sai_cleanup_done" for pcr in SAMPLES])
@@ -811,48 +987,141 @@ def get_cleanup_markers():
         markers.extend([f"results/libraries/{pcr}/mtdna_mapping/.sai_cleanup_done" for pcr in SAMPLES])
         markers.extend([f"results/libraries/{pcr}/mtdna_mapping/.intermediate_cleanup_done" for pcr in SAMPLES])
     # Pathogen cleanup
-    for sample, ref_name_safe in get_sample_ref_pairs_safe():
-        markers.append(f"results/pathogen/{sample}/pathogen_mapping/.{ref_name_safe}_sai_cleanup_done")
-        markers.append(f"results/pathogen/{sample}/pathogen_mapping/.{ref_name_safe}_intermediate_cleanup_done")
+    if ENABLE_PATHOGEN_AUTHENTICATION:
+        for sample, ref_name_safe in get_sample_ref_pairs_safe():
+            markers.append(f"results/pathogen/{sample}/pathogen_mapping/.{ref_name_safe}_sai_cleanup_done")
+            markers.append(f"results/pathogen/{sample}/pathogen_mapping/.{ref_name_safe}_intermediate_cleanup_done")
     return markers
 
 
 ###--------------------------wrappers-----------------------------------------------------
 
 
-###-----------------------------------------------rules-------------------------------------------------------------------------------
+def pipeline_target_inputs(
+    *,
+    include_host=None,
+    include_meta=None,
+    include_auth=None,
+):
+    """
+    Build the target file list for default / stage entry points.
 
-rule all:
-    input:
+    ``None`` means follow global config (``HOST_MTDNA_ANALYSIS_ENABLED``,
+    ``ENABLE_METAGENOMICS``, ``ENABLE_PATHOGEN_AUTHENTICATION``).
+    Named stage rules pass explicit True/False to override without rewriting YAML.
+    Per-library samples.tsv skips still apply inside each enabled stage.
+    """
+    host = HOST_MTDNA_ANALYSIS_ENABLED if include_host is None else bool(include_host)
+    meta = ENABLE_METAGENOMICS if include_meta is None else bool(include_meta)
+    auth = ENABLE_PATHOGEN_AUTHENTICATION if include_auth is None else bool(include_auth)
+    if not meta:
+        auth = False
+
+    if include_meta is None:
+        meta_pcrs, meta_bios = META_PCRS, META_BIOS
+    elif meta:
+        meta_pcrs = [s for s in SAMPLES if not PCR_INFO[s].get("skip_metagenomics")]
+        meta_bios = [
+            b for b in BIO_SAMPLES if any(p in meta_pcrs for p in SAMPLE_TO_PCRS[b])
+        ]
+    else:
+        meta_pcrs, meta_bios = [], []
+
+    if include_auth is None:
+        auth_bios = AUTH_BIOS if auth else []
+    elif auth:
+        auth_bios = [
+            b
+            for b in meta_bios
+            if any(
+                not PCR_INFO[p].get("skip_pathogen_authentication")
+                for p in SAMPLE_TO_PCRS[b]
+            )
+        ]
+    else:
+        auth_bios = []
+
+    if not auth_bios:
+        auth = False
+
+    # HOPS/decOM only when meta is on via config modules (stage override still needs flags)
+    hops_on = bool(ENABLE_HOPS and meta)
+    decom_on = bool(ENABLE_DECOM and meta)
+
+    targets = [
         PIGSTI_VALIDATION_OK,
-        expand("results/libraries/{sample}/adapter_removal/{sample}.collapsed.gz", sample=SAMPLES),
-        expand("results/libraries/{sample}/prinseq/{sample}-passed.fq.gz", sample=SAMPLES),
-        expand("results/metagenomics/krakenuniq/{sample}/{sample}_kraken-report.txt", sample=BIO_SAMPLES),
-        expand("results/libraries/{sample}/fastq_screen/{sample}.collapsed_screen.html", sample=SAMPLES),
-        expand("results/libraries/{sample}/fastq_screen/{sample}_best_species.txt", sample=SAMPLES),
-        # Disabled for now: by-type fastq_screen symlinks can race with cleanup on some filesystems
-        # expand(f"{BY_TYPE_ROOT}/fastq_screen/{{sample}}/{{sample}}.collapsed_screen.html", sample=SAMPLES),
-
-        # Host/mtDNA analysis outputs (skip in pathogen_screening_only mode)
+        *expand(
+            "results/libraries/{sample}/adapter_removal/{sample}.collapsed.gz",
+            sample=SAMPLES,
+        ),
         *(
+            expand(
+                "results/libraries/{sample}/prinseq/{sample}-passed.fq.gz",
+                sample=meta_pcrs,
+            )
+            if meta
+            else []
+        ),
+        *(
+            expand(
+                "results/metagenomics/krakenuniq/{sample}/{sample}_kraken-report.txt",
+                sample=meta_bios,
+            )
+            if meta
+            else []
+        ),
+        *expand(
+            "results/libraries/{sample}/fastq_screen/{sample}.collapsed_screen.html",
+            sample=SAMPLES,
+        ),
+        *expand(
+            "results/libraries/{sample}/fastq_screen/{sample}_best_species.txt",
+            sample=SAMPLES,
+        ),
+    ]
+
+    if host:
+        targets.extend(
             [
-                # Host alignments (final outputs only; intermediates are cleaned up if cleanup_intermediates is enabled)
-                *expand("results/libraries/{sample}/host_mapping/{sample}.dedup.bam", sample=SAMPLES),
-                *expand("results/libraries/{sample}/host_mapping/{sample}.dedup.bam.bai", sample=SAMPLES),
-                *expand("results/libraries/{sample}/host_mapping/{sample}.dedup_q30_softclipped.cram", sample=SAMPLES),
-                *expand("results/libraries/{sample}/host_mapping/{sample}.dedup.metrics.txt", sample=SAMPLES),
-                *expand("results/libraries/{sample}/host_mapping/{sample}.q30_metrics.txt", sample=SAMPLES),
-                *expand(f"{BY_TYPE_ROOT}/host_mapping/{{sample}}/{{sample}}.dedup.bam", sample=SAMPLES),
-
-                # Per-sample merged host BAMs
-                *expand("results/host/host_mapping/{sample}.dedup.merged.bam", sample=BIO_SAMPLES),
-
-                # Host QC and damage
-                *expand("results/libraries/{sample}/qualimap/genome_results.txt", sample=SAMPLES),
-                *expand("results/libraries/{sample}/qualimap_mtdna/genome_results.txt", sample=SAMPLES),
-                *expand("results/libraries/{sample}/damageprofiler_host", sample=SAMPLES),
-
-                # Genetic sexing (Cow, Goat, Sheep, Dog only; others skipped in rule)
+                *expand(
+                    "results/libraries/{sample}/host_mapping/{sample}.dedup.bam",
+                    sample=SAMPLES,
+                ),
+                *expand(
+                    "results/libraries/{sample}/host_mapping/{sample}.dedup.bam.bai",
+                    sample=SAMPLES,
+                ),
+                *expand(
+                    "results/libraries/{sample}/host_mapping/{sample}.dedup_q30_softclipped.cram",
+                    sample=SAMPLES,
+                ),
+                *expand(
+                    "results/libraries/{sample}/host_mapping/{sample}.dedup.metrics.txt",
+                    sample=SAMPLES,
+                ),
+                *expand(
+                    "results/libraries/{sample}/host_mapping/{sample}.q30_metrics.txt",
+                    sample=SAMPLES,
+                ),
+                *expand(
+                    f"{BY_TYPE_ROOT}/host_mapping/{{sample}}/{{sample}}.dedup.bam",
+                    sample=SAMPLES,
+                ),
+                *expand(
+                    "results/host/host_mapping/{sample}.dedup.merged.bam",
+                    sample=BIO_SAMPLES,
+                ),
+                *expand(
+                    "results/libraries/{sample}/qualimap/genome_results.txt",
+                    sample=SAMPLES,
+                ),
+                *expand(
+                    "results/libraries/{sample}/qualimap_mtdna/genome_results.txt",
+                    sample=SAMPLES,
+                ),
+                *expand(
+                    "results/libraries/{sample}/damageprofiler_host", sample=SAMPLES
+                ),
                 *(
                     expand(
                         [
@@ -864,117 +1133,220 @@ rule all:
                     if ENABLE_SEXING
                     else []
                 ),
-
-                # Sample-level Qualimap on merged BAMs
-                *expand("results/samples/{sample}/qualimap/genome_results.txt", sample=BIO_SAMPLES),
-                *expand("results/samples/{sample}/qualimap_mtdna/genome_results.txt", sample=BIO_SAMPLES),
-
-                # mtDNA alignments (final outputs only)
-                *expand("results/libraries/{sample}/mtdna_mapping/{sample}.dedup.bam", sample=SAMPLES),
-                *expand("results/libraries/{sample}/mtdna_mapping/{sample}.dedup.bam.bai", sample=SAMPLES),
-                *expand("results/libraries/{sample}/mtdna_mapping/{sample}.dedup.metrics.txt", sample=SAMPLES),
-                *expand("results/libraries/{sample}/mtdna_mapping/{sample}.q30_metrics.txt", sample=SAMPLES),
-                *expand(f"{BY_TYPE_ROOT}/mtdna_mapping/{{sample}}/{{sample}}.dedup.bam", sample=SAMPLES),
-
-                # Per-sample merged mtDNA BAMs
-                *expand("results/host/mtdna_mapping/{sample}.dedup.merged.bam", sample=BIO_SAMPLES),
-                *expand("results/libraries/{sample}/mtdna_mapping/{sample}.dedup_q30_softclipped.cram", sample=SAMPLES),
-
-                # mtDNA QC and damage
-                *expand("results/libraries/{sample}/damageprofiler_mtdna", sample=SAMPLES),
+                *expand(
+                    "results/samples/{sample}/qualimap/genome_results.txt",
+                    sample=BIO_SAMPLES,
+                ),
+                *expand(
+                    "results/samples/{sample}/qualimap_mtdna/genome_results.txt",
+                    sample=BIO_SAMPLES,
+                ),
+                *expand(
+                    "results/libraries/{sample}/mtdna_mapping/{sample}.dedup.bam",
+                    sample=SAMPLES,
+                ),
+                *expand(
+                    "results/libraries/{sample}/mtdna_mapping/{sample}.dedup.bam.bai",
+                    sample=SAMPLES,
+                ),
+                *expand(
+                    "results/libraries/{sample}/mtdna_mapping/{sample}.dedup.metrics.txt",
+                    sample=SAMPLES,
+                ),
+                *expand(
+                    "results/libraries/{sample}/mtdna_mapping/{sample}.q30_metrics.txt",
+                    sample=SAMPLES,
+                ),
+                *expand(
+                    f"{BY_TYPE_ROOT}/mtdna_mapping/{{sample}}/{{sample}}.dedup.bam",
+                    sample=SAMPLES,
+                ),
+                *expand(
+                    "results/host/mtdna_mapping/{sample}.dedup.merged.bam",
+                    sample=BIO_SAMPLES,
+                ),
+                *expand(
+                    "results/libraries/{sample}/mtdna_mapping/{sample}.dedup_q30_softclipped.cram",
+                    sample=SAMPLES,
+                ),
+                *expand(
+                    "results/libraries/{sample}/damageprofiler_mtdna", sample=SAMPLES
+                ),
             ]
-            if HOST_MTDNA_ANALYSIS_ENABLED
-            else []
-        ),
+        )
 
-        # E-Score outputs
-        expand("results/pathogen/{sample}/evalue/genus/{sample}_genus.csv", sample=BIO_SAMPLES),
-        expand("results/pathogen/{sample}/evalue/species/{sample}_species.csv", sample=BIO_SAMPLES),
-        expand("results/pathogen/{sample}/evalue/pathogen/{sample}_pathogen.csv", sample=BIO_SAMPLES),
-        expand(f"{BY_TYPE_ROOT}/evalue/pathogen/{{sample}}/{{sample}}_pathogen.csv", sample=BIO_SAMPLES),
-
-        # Comparison outputs (only if HOPS is enabled)
-        *(expand("results/pathogen/{sample}/comparison/{sample}_comparison.tsv", sample=BIO_SAMPLES) if ENABLE_HOPS else []),
-        *(expand("results/pathogen/{sample}/comparison/{sample}_heatmap.html", sample=BIO_SAMPLES) if ENABLE_HOPS else []),
-
-        # decOM (optional)
-        *(
+    if meta:
+        targets.extend(
             [
-                "results/metagenomics/decOM/p_sink.txt",
-                *expand("results/metagenomics/decOM/p_keys/{sample}.fof", sample=BIO_SAMPLES),
-                DECOM_OUTPUT_DIR,
+                *expand(
+                    "results/pathogen/{sample}/evalue/genus/{sample}_genus.csv",
+                    sample=meta_bios,
+                ),
+                *expand(
+                    "results/pathogen/{sample}/evalue/species/{sample}_species.csv",
+                    sample=meta_bios,
+                ),
+                *expand(
+                    "results/pathogen/{sample}/evalue/pathogen/{sample}_pathogen.csv",
+                    sample=meta_bios,
+                ),
+                *expand(
+                    f"{BY_TYPE_ROOT}/evalue/pathogen/{{sample}}/{{sample}}_pathogen.csv",
+                    sample=meta_bios,
+                ),
+                *(
+                    expand(
+                        "results/pathogen/{sample}/comparison/{sample}_comparison.tsv",
+                        sample=meta_bios,
+                    )
+                    if hops_on
+                    else []
+                ),
+                *(
+                    expand(
+                        "results/pathogen/{sample}/comparison/{sample}_heatmap.html",
+                        sample=meta_bios,
+                    )
+                    if hops_on
+                    else []
+                ),
+                *(
+                    [
+                        "results/metagenomics/decOM/p_sink.txt",
+                        *expand(
+                            "results/metagenomics/decOM/p_keys/{sample}.fof",
+                            sample=meta_bios,
+                        ),
+                        DECOM_OUTPUT_DIR,
+                    ]
+                    if decom_on
+                    else []
+                ),
+                *expand(
+                    "results/metagenomics/krakenuniq/{sample}/{sample}_output.txt",
+                    sample=meta_bios,
+                ),
+                *(
+                    ["results/metagenomics/hops/maltExtract/heatmap_overview_Wevid.tsv"]
+                    if hops_on
+                    else []
+                ),
+                "lists/krakenuniq_pathogen_list.txt",
+                "lists/hops_pathogen_list.txt",
+                "config/config_hops_custom.txt",
+                "results/metagenomics/kraken_abundance/krakenuniq_abundance_matrix_absolute.csv",
+                "results/metagenomics/kraken_abundance/krakenuniq_abundance_matrix_normalized.csv",
+                "results/metagenomics/kraken_abundance/heatmap_absolute.pdf",
+                "results/metagenomics/kraken_abundance/heatmap_normalized.pdf",
+                *(
+                    [
+                        "results/metagenomics/pathogen_detection/detection_scores_heatmap.pdf",
+                        "results/metagenomics/pathogen_detection/detection_scores_matrix.csv",
+                        "results/metagenomics/pathogen_detection/detailed_scores.csv",
+                    ]
+                    if hops_on
+                    else []
+                ),
             ]
-            if ENABLE_DECOM
-            else []
-        ),
+        )
 
-        # Shared/global files
-        expand("results/metagenomics/krakenuniq/{sample}/{sample}_output.txt", sample=BIO_SAMPLES),
-        *(["results/metagenomics/hops/maltExtract/heatmap_overview_Wevid.tsv"] if ENABLE_HOPS else []),
-        "lists/krakenuniq_pathogen_list.txt",
-        "lists/hops_pathogen_list.txt",
-        "config/config_hops_custom.txt",
-        "results/metagenomics/kraken_abundance/krakenuniq_abundance_matrix_absolute.csv",
-        "results/metagenomics/kraken_abundance/krakenuniq_abundance_matrix_normalized.csv",
-        "results/metagenomics/kraken_abundance/heatmap_absolute.pdf",
-        "results/metagenomics/kraken_abundance/heatmap_normalized.pdf",
+    if host:
+        targets.append("results/final/host_mtdna_summary_all_samples.xlsx")
 
-        # Do NOT list results/workflow/pathogen_targets.txt here: it is the checkpoint
-        # generate_pathogen_targets output. Snakemake#823 — having a checkpoint
-        # file as a direct target in rule all can leave bowtie2_pathogen_align etc.
-        # stuck ("no jobs ready"). Downstream rules already pull it in via inputs
-        # or checkpoints.generate_pathogen_targets.get().
+    if auth:
+        targets.extend(
+            [
+                "results/final/pathogen_summary_all_samples.xlsx",
+                "results/final/pathogen_detection_scores_heatmap.png",
+                "results/final/pathogen_detection_scores_heatmap.pdf",
+                "results/workflow/pathogen_mapping_complete.txt",
+                "results/workflow/pathogen_reports_complete.txt",
+                *(
+                    ["results/final/pathogen_summary_all_samples_pcr.xlsx"]
+                    if PATHOGEN_MODE == "super_careful"
+                    else []
+                ),
+                *[
+                    f"results/pathogen/{sample}/summary/{sample}_sample_report.pdf"
+                    for sample in auth_bios
+                    if host
+                ],
+                "results/workflow/index_status/pathogen_indices_built.txt",
+            ]
+        )
 
-        # Final summary reports
-        *(["results/final/host_mtdna_summary_all_samples.xlsx"] if HOST_MTDNA_ANALYSIS_ENABLED else []),
-        "results/final/pathogen_summary_all_samples.xlsx",
-        "results/final/pathogen_detection_scores_heatmap.png",
-        "results/final/pathogen_detection_scores_heatmap.pdf",
-        "results/final/comprehensive_summary_all_samples.xlsx",
-        *(["results/final/multi_qc_dashboard.html"] if (ENABLE_MULTI_QC_DASHBOARD and HOST_MTDNA_ANALYSIS_ENABLED) else []),
-        *(["results/final/pathogen_summary_all_samples_pcr.xlsx"] if PATHOGEN_MODE == "super_careful" else []),
-        # Per-sample reports
-        *[
-            f"results/pathogen/{sample}/summary/{sample}_sample_report.pdf"
-            for sample in BIO_SAMPLES
-            if HOST_MTDNA_ANALYSIS_ENABLED
-        ],
-        # Global barrier: all pathogen align + QC (qualimap, damage, etc.) must finish
-        # before summarize_pathogen_data (via pathogen_mapping_complete.txt). Restores correct
-        # coverage/ANI/entropy in summaries; expand_downstream_targets matches checkpoint.
-        "results/workflow/pathogen_mapping_complete.txt",
-        # Pathogen-specific PDF reports (generated from checkpoint targets).
-        "results/workflow/pathogen_reports_complete.txt",
-        # Reproducibility manifest (file hashes + config snapshot).
-        "results/run_manifest.json",
-        *([
-            "results/metagenomics/pathogen_detection/detection_scores_heatmap.pdf",
-            "results/metagenomics/pathogen_detection/detection_scores_matrix.csv",
-            "results/metagenomics/pathogen_detection/detailed_scores.csv",
-        ] if ENABLE_HOPS else []),
+    targets.extend(
+        [
+            "results/final/comprehensive_summary_all_samples.xlsx",
+            *(
+                ["results/final/multi_qc_dashboard.html"]
+                if (ENABLE_MULTI_QC_DASHBOARD and host)
+                else []
+            ),
+            "results/run_manifest.json",
+            "results/final/pipeline_execution_report.html",
+            "results/final/pipeline_timing_data.csv",
+            "results/final/pipeline_workflow_diagram.html",
+            "results/final/pipeline_workflow_diagram.png",
+            "results/final/pipeline_workflow_diagram.svg",
+            "results/workflow/index_status/host_indices_built.txt",
+            *(
+                ["results/workflow/index_status/mtdna_indices_built.txt"]
+                if host
+                else []
+            ),
+            *get_cleanup_markers(),
+            *(["results/final/output_catalog.tsv"] if BUILD_RESULTS_CATALOG else []),
+        ]
+    )
+    return targets
 
-        # Pipeline execution report and workflow diagram (always; independent of HOPS)
-        "results/final/pipeline_execution_report.html",
-        "results/final/pipeline_timing_data.csv",
-        "results/final/pipeline_workflow_diagram.html",
-        "results/final/pipeline_workflow_diagram.png",
-        "results/final/pipeline_workflow_diagram.svg",
 
-        # Index status
-        "results/workflow/index_status/pathogen_indices_built.txt",
-        "results/workflow/index_status/host_indices_built.txt",
-        *(["results/workflow/index_status/mtdna_indices_built.txt"] if HOST_MTDNA_ANALYSIS_ENABLED else []),
+###-----------------------------------------------rules-------------------------------------------------------------------------------
 
-        # Cleanup markers (only if cleanup_intermediates is enabled in config)
-        *get_cleanup_markers(),
+rule all:
+    """Default target: full pipeline as enabled in config + samples.tsv skips."""
+    input:
+        pipeline_target_inputs()
 
-        # Browse catalog (grouped view; does not move canonical outputs)
-        *(
-            ["results/final/output_catalog.tsv"]
-            if BUILD_RESULTS_CATALOG
-            else []
-        ),
+rule host_only:
+    """Trim → FastQ Screen → host/mtDNA QC (no metagenomics / pathogen auth)."""
+    input:
+        pipeline_target_inputs(include_host=True, include_meta=False, include_auth=False)
 
+rule metagenomics_only:
+    """Trim → screening (Kraken/E-value ± HOPS/decOM); no host mapping, no pathogen auth."""
+    input:
+        pipeline_target_inputs(include_host=False, include_meta=True, include_auth=False)
+
+rule pathogen_auth:
+    """Metagenomics + pathogen reference mapping / authentication (host follows config)."""
+    input:
+        pipeline_target_inputs(
+            include_host=HOST_MTDNA_ANALYSIS_ENABLED,
+            include_meta=True,
+            include_auth=True,
+        )
+
+rule preflight:
+    """Print which stages will run (config + samples.tsv); does not run tools."""
+    output:
+        "results/workflow/preflight_report.txt"
+    run:
+        import subprocess
+        Path("results/workflow").mkdir(parents=True, exist_ok=True)
+        subprocess.check_call(
+            [
+                sys.executable,
+                "scripts/pigsti_preflight.py",
+                "--config",
+                "config/config.yaml",
+                "--samples",
+                SAMPLES_TSV,
+                "--output",
+                str(output[0]),
+            ]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -986,16 +1358,16 @@ rule all:
 rule metagenomics_screening_cohort_ready:
     input:
         evalue_pathogen=expand(
-            "results/pathogen/{sample}/evalue/pathogen/{sample}_pathogen.csv", sample=BIO_SAMPLES
+            "results/pathogen/{sample}/evalue/pathogen/{sample}_pathogen.csv", sample=META_BIOS
         ),
         evalue_genus=expand(
-            "results/pathogen/{sample}/evalue/genus/{sample}_genus.csv", sample=BIO_SAMPLES
+            "results/pathogen/{sample}/evalue/genus/{sample}_genus.csv", sample=META_BIOS
         ),
         evalue_species=expand(
-            "results/pathogen/{sample}/evalue/species/{sample}_species.csv", sample=BIO_SAMPLES
+            "results/pathogen/{sample}/evalue/species/{sample}_species.csv", sample=META_BIOS
         ),
         kraken_report=expand(
-            "results/metagenomics/krakenuniq/{sample}/{sample}_kraken-report.txt", sample=BIO_SAMPLES
+            "results/metagenomics/krakenuniq/{sample}/{sample}_kraken-report.txt", sample=META_BIOS
         ),
         *(
             ["results/metagenomics/hops/maltExtract/heatmap_overview_Wevid.tsv"]
@@ -1014,19 +1386,21 @@ rule metagenomics_screening_cohort_ready:
             df = pd.read_csv(p)
             if "taxonomy" not in df.columns:
                 raise ValueError(f"E-value pathogen CSV missing 'taxonomy' column: {p}")
-        missing = sorted(set(BIO_SAMPLES) - seen)
+        missing = sorted(set(META_BIOS) - seen)
         if missing:
             raise ValueError(
-                "metagenomics_screening_cohort_ready: not all biological samples have "
-                f"completed E-score outputs. Missing: {missing}"
+                "metagenomics_screening_cohort_ready: missing E-value pathogen CSVs for: "
+                + ", ".join(missing)
             )
-        os.makedirs(os.path.dirname(output.flag), exist_ok=True)
+        Path(output.flag).parent.mkdir(parents=True, exist_ok=True)
         with open(output.flag, "w", encoding="utf-8") as fh:
             json.dump(
                 {
                     "status": "ready",
-                    "cohort_samples": sorted(BIO_SAMPLES),
-                    "n_samples": len(BIO_SAMPLES),
+                    "n_bios": len(META_BIOS),
+                    "cohort_samples": sorted(META_BIOS),
+                    "auth_samples": sorted(AUTH_BIOS),
+                    "n_samples": len(META_BIOS),
                     "hops_enabled": bool(ENABLE_HOPS),
                 },
                 fh,
@@ -1039,7 +1413,7 @@ checkpoint generate_pathogen_targets:
     input:
         cohort_ready="results/workflow/metagenomics_screening_cohort_ready.json",
         evalue_files=expand(
-            "results/pathogen/{sample}/evalue/pathogen/{sample}_pathogen.csv", sample=BIO_SAMPLES
+            "results/pathogen/{sample}/evalue/pathogen/{sample}_pathogen.csv", sample=META_BIOS
         ),
         *(["results/metagenomics/hops/maltExtract/heatmap_overview_Wevid.tsv"] if ENABLE_HOPS else []),
     output:
@@ -1048,7 +1422,7 @@ checkpoint generate_pathogen_targets:
     conda:
         "workflow/envs/python.yaml",
     params:
-        bio_samples=" ".join(BIO_SAMPLES),
+        bio_samples=" ".join(AUTH_BIOS),
         hops_arg=(
             '--hops "results/metagenomics/hops/maltExtract/heatmap_overview_Wevid.tsv"'
             if ENABLE_HOPS
@@ -1161,7 +1535,7 @@ rule pathogen_mapping_targets:
     run:
         with open(input.manifest, encoding="utf-8") as fh:
             man = json.load(fh)
-        expected = sorted(BIO_SAMPLES)
+        expected = sorted(AUTH_BIOS)
         got = sorted(man.get("cohort_samples") or [])
         if got != expected:
             raise ValueError(
@@ -1227,13 +1601,24 @@ if PATHOGEN_ALIGNER == "bwa":
             bwa_ready = "results/workflow/index_status/bwa_{ref_name_safe}.done",
         output:
             sai = "results/pathogen/{sample}/pathogen_mapping/{sample}_{ref_name_safe}.sai"
+        log:
+            "logs/pathogen_mapping/{sample}_{ref_name_safe}_bwa_aln.log"
         conda:
             "workflow/envs/bwa.yaml"
         threads: 6
         params:
-            reference = lambda wc: get_reference_from_safe_name(wc.ref_name_safe)
+            reference = lambda wc: get_reference_from_safe_name(wc.ref_name_safe),
+            verbose="true" if ENABLE_VERBOSE else "false",
         shell:
-            "bwa aln -l 1024 -n 0.01 -o 2 -t {threads} {params.reference} {input.reads} > {output.sai}"
+            """
+            set -euo pipefail
+            mkdir -p "$(dirname {log})"
+            if [ "{params.verbose}" = "true" ]; then
+              bwa aln -l 1024 -n 0.01 -o 2 -t {threads} {params.reference} {input.reads} > {output.sai} 2> >(tee -a {log} >&2)
+            else
+              bwa aln -l 1024 -n 0.01 -o 2 -t {threads} {params.reference} {input.reads} > {output.sai} 2>> {log}
+            fi
+            """
 
     rule bwa_samse:
         input:
@@ -1242,15 +1627,25 @@ if PATHOGEN_ALIGNER == "bwa":
             bwa_ready = "results/workflow/index_status/bwa_{ref_name_safe}.done",
         output:
             bam = "results/pathogen/{sample}/pathogen_mapping/{sample}_{ref_name_safe}_F4.bam"
+        log:
+            "logs/pathogen_mapping/{sample}_{ref_name_safe}_bwa_samse.log"
         conda:
             "workflow/envs/bwa.yaml"
         params:
             reference =  lambda wc: get_reference_from_safe_name(wc.ref_name_safe),
-            read_group = get_read_group
+            read_group = get_read_group,
+            verbose="true" if ENABLE_VERBOSE else "false",
         shell:
             """
-            bwa samse -r '{params.read_group}' {params.reference} {input.sai} {input.reads} | \
-            samtools view -F 4 -Sb - > {output.bam}
+            set -euo pipefail
+            mkdir -p "$(dirname {log})"
+            if [ "{params.verbose}" = "true" ]; then
+              bwa samse -r '{params.read_group}' {params.reference} {input.sai} {input.reads} 2> >(tee -a {log} >&2) | \
+              samtools view -F 4 -Sb - > {output.bam}
+            else
+              bwa samse -r '{params.read_group}' {params.reference} {input.sai} {input.reads} 2>> {log} | \
+              samtools view -F 4 -Sb - > {output.bam}
+            fi
             """
 
     rule bwa_sort:
@@ -1294,15 +1689,21 @@ else:
             fai_ready = "results/workflow/index_status/faidx_{ref_name_safe}.done",
         output:
             bam = "results/pathogen/{sample}/pathogen_mapping/{sample}_{ref_name_safe}_F4_q30_sort.bam"
+        log:
+            "logs/pathogen_mapping/{sample}_{ref_name_safe}_bowtie2.log"
         threads: 6
         conda:
             "workflow/envs/bowtie2.yaml"
         params:
             prefix = get_bowtie2_pathogen_prefix,
-            ref = lambda wc: get_reference_from_safe_name(wc.ref_name_safe)
+            ref = lambda wc: get_reference_from_safe_name(wc.ref_name_safe),
+            quiet_arg=BT2_QUIET_ARG,
+            verbose="true" if ENABLE_VERBOSE else "false",
         shell:
             """
-            mkdir -p results/samples/{wildcards.sample}/pathogen_mapping
+            set -euo pipefail
+            mkdir -p results/pathogen/{wildcards.sample}/pathogen_mapping
+            mkdir -p "$(dirname {log})"
 
             # ---------------- Concurrency-safe Bowtie2 index build ----------------
             idx_prefix="{params.prefix}"
@@ -1320,28 +1721,38 @@ else:
             }}
 
             if ! index_complete; then
-                echo "[bowtie2_pathogen_align] Bowtie2 index not complete for {wildcards.ref_name_safe} at $idx_prefix"
+                echo "[bowtie2_pathogen_align] Bowtie2 index not complete for {wildcards.ref_name_safe} at $idx_prefix" >> {log}
                 # Try to acquire build lock
                 if ( set -o noclobber; > "$lock_file" ) 2>/dev/null; then
                     trap 'rm -f "$lock_file"' EXIT
-                    echo "[bowtie2_pathogen_align] Building Bowtie2 index from $ref_fa ..."
-                    bowtie2-build "$ref_fa" "$idx_prefix"
+                    echo "[bowtie2_pathogen_align] Building Bowtie2 index from $ref_fa ..." >> {log}
+                    if [ "{params.verbose}" = "true" ]; then
+                      bowtie2-build "$ref_fa" "$idx_prefix" 2>&1 | tee -a {log}
+                    else
+                      bowtie2-build "$ref_fa" "$idx_prefix" >> {log} 2>&1
+                    fi
                     rm -f "$lock_file"
                     trap - EXIT
                 else
-                    echo "[bowtie2_pathogen_align] Another job is building the index, waiting..."
+                    echo "[bowtie2_pathogen_align] Another job is building the index, waiting..." >> {log}
                     # Wait until index is complete
                     while ! index_complete; do
                         sleep 10
                     done
-                    echo "[bowtie2_pathogen_align] Index for {wildcards.ref_name_safe} is now complete."
+                    echo "[bowtie2_pathogen_align] Index for {wildcards.ref_name_safe} is now complete." >> {log}
                 fi
             fi
 
             # ---------------- Pathogen alignment ----------------
-            bowtie2 --end-to-end --sensitive -x {params.prefix} -U {input.reads} -p {threads} | \
-            samtools view -b -q 30 - | \
-            samtools sort -@ {threads} -o {output.bam}
+            if [ "{params.verbose}" = "true" ]; then
+              bowtie2 {params.quiet_arg} --end-to-end --sensitive -x {params.prefix} -U {input.reads} -p {threads} 2> >(tee -a {log} >&2) | \
+              samtools view -b -q 30 - | \
+              samtools sort -@ {threads} -o {output.bam}
+            else
+              bowtie2 {params.quiet_arg} --end-to-end --sensitive -x {params.prefix} -U {input.reads} -p {threads} 2>> {log} | \
+              samtools view -b -q 30 - | \
+              samtools sort -@ {threads} -o {output.bam}
+            fi
             """
 
 rule mark_duplicates:
@@ -1353,7 +1764,8 @@ rule mark_duplicates:
     threads: MARKDUP_THREADS
     conda: "workflow/envs/picard.yaml"
     params:
-        dedup_tool=DEDUP_TOOL
+        dedup_tool=DEDUP_TOOL,
+        picard_quiet=PICARD_QUIET_ARG,
     shell:
         """
         if [ "{params.dedup_tool}" = "samtools" ]; then
@@ -1372,7 +1784,8 @@ rule mark_duplicates:
                 M={output.metrics} \
                 REMOVE_DUPLICATES=true \
                 ASSUME_SORTED=true \
-                VALIDATION_STRINGENCY=SILENT
+                VALIDATION_STRINGENCY=SILENT \
+                {params.picard_quiet}
         fi
         """
 
@@ -1417,17 +1830,27 @@ rule damageprofiler:
         fai_ready = "results/workflow/index_status/faidx_{ref_name_safe}.done"
     output:
         directory("results/pathogen/{sample}/pathogen_mapping/damageprofiler_{ref_name_safe}")
+    log:
+        "logs/damageprofiler/{sample}_{ref_name_safe}.log"
     conda: "workflow/envs/damageprofiler.yaml"
+    params:
+        verbose=VERBOSE_FLAG,
     shell:
         """
+        set -euo pipefail
         mkdir -p {output}
-        mapped_count=$(samtools view -c -F 4 {input.bam})
+        mkdir -p "$(dirname {log})"
+        mapped_count=$(samtools view -c -F 4 {input.bam} 2>/dev/null || echo "0")
         if [ "$mapped_count" -eq 0 ]; then
-            echo "No mapped reads in {input.bam}. Skipping DamageProfiler." >&2
+            echo "No mapped reads in {input.bam}. Skipping DamageProfiler." >> {log}
             : > {output}/misincorporation.txt
             echo "No mapped reads. DamageProfiler skipped." > {output}/NO_MAPPED_READS.txt
         else
-            damageprofiler -i {input.bam} -o {output} -r {input.ref}
+            if [ "{params.verbose}" = "true" ]; then
+              damageprofiler -i {input.bam} -o {output} -r {input.ref} 2> >(tee -a {log} >&2)
+            else
+              damageprofiler -i {input.bam} -o {output} -r {input.ref} >> {log} 2>&1
+            fi
         fi
         """
 
@@ -1801,7 +2224,22 @@ rule calculate_collapsed_reads:
         fi
         """
 
+def get_staging_r1(wc):
+    """R1 path used when enable_trimming=false (staged as collapsed.gz)."""
+    sid = wc.sample
+    if sid not in SAMPLES_DICT and sid in SAMPLE_TO_PCRS:
+        sid = SAMPLE_TO_PCRS[sid][0]
+    if sid not in SAMPLES_DICT:
+        raise Exception(f"Sample '{wc.sample}' not found in samples.tsv. Available PCR IDs: {list(SAMPLES_DICT.keys())}")
+    return _resolve_existing_fastq_path(SAMPLES_DICT[sid]["r1"][0], sid, "R1")
+
+
+# AdapterRemoval / cutadapt / stage-pretrimmed: disjoint wildcards via
+# TRIM_PE_PCRS / TRIM_SE_PCRS / SKIP_TRIM_PCRS (global enable_trimming + samples.tsv skip_trimming)
+
 rule adapter_removal_pe:
+    wildcard_constraints:
+        sample=_wc_alt(TRIM_PE_PCRS),
     input:
         r1 = lambda wc: get_adapter_removal_inputs_pe(wc)["r1"],
         r2 = lambda wc: get_adapter_removal_inputs_pe(wc)["r2"]
@@ -1873,6 +2311,8 @@ rule adapter_removal_pe:
         """
 
 rule adapter_removal_se:
+    wildcard_constraints:
+        sample=_wc_alt(TRIM_SE_PCRS),
     input:
         r1 = lambda wc: get_adapter_removal_inputs_se(wc)["r1"]
     output:
@@ -1928,6 +2368,54 @@ rule adapter_removal_se:
             echo "Creating empty output file to allow pipeline to continue..." >> {log}
             echo -n | gzip > {output.collapsed}
             exit 0
+        fi
+        """
+
+rule stage_pretrimmed_as_collapsed:
+    """
+    Skip AdapterRemoval/cutadapt: stage samples.tsv R1 as the collapsed FASTQ
+    expected by FastQ Screen, host mapping, and metagenomics.
+
+    Prefer already-collapsed / pre-trimmed single-end FASTQs in the r1 column.
+    If a PE r2 path is present it is ignored.
+    """
+    wildcard_constraints:
+        sample=_wc_alt(SKIP_TRIM_PCRS),
+    input:
+        r1 = get_staging_r1,
+    output:
+        collapsed = maybe_temp("results/libraries/{sample}/adapter_removal/{sample}.collapsed.gz")
+    log:
+        "logs/adapter_removal/{sample}_skip_trimming.log"
+    params:
+        strict_inputs=lambda wc: "true" if STRICT_INPUTS else "false",
+    threads: 1
+    shell:
+        """
+        set -eo pipefail
+        mkdir -p results/libraries/{wildcards.sample}/adapter_removal
+        echo "skip_trimming: staging R1 as collapsed.gz for {wildcards.sample} at $(date)" > {log}
+        echo "Input R1: {input.r1}" >> {log}
+
+        if [ ! -r "{input.r1}" ] || [ ! -s "{input.r1}" ]; then
+            echo "ERROR: Missing or empty input FASTQ for {wildcards.sample}" >> {log}
+            if [ "{params.strict_inputs}" = "true" ]; then
+                exit 1
+            fi
+            echo -n | gzip > {output.collapsed}
+            exit 0
+        fi
+
+        # Prefer hard link / symlink to avoid copying large FASTQs; fall back to copy.
+        SRC="$(readlink -f "{input.r1}" 2>/dev/null || realpath "{input.r1}" 2>/dev/null || echo "{input.r1}")"
+        rm -f "{output.collapsed}"
+        if ln "$SRC" "{output.collapsed}" 2>/dev/null; then
+            echo "Hard-linked $SRC -> {output.collapsed}" >> {log}
+        elif ln -s "$SRC" "{output.collapsed}" 2>/dev/null; then
+            echo "Symlinked $SRC -> {output.collapsed}" >> {log}
+        else
+            cp -f "$SRC" "{output.collapsed}"
+            echo "Copied $SRC -> {output.collapsed}" >> {log}
         fi
         """
 
@@ -2154,13 +2642,26 @@ rule bowtie2_unaligned:
         passed="results/libraries/{sample}/prinseq/{sample}-passed.fq.gz"
     output:
         bam="results/libraries/{sample}/bowtie2/{sample}_unaligned.bam"
+    log:
+        "logs/bowtie2_unaligned/{sample}.log"
     threads: 6
     conda:
         "workflow/envs/bowtie2.yaml"
+    params:
+        quiet_arg=BT2_QUIET_ARG,
+        verbose="true" if ENABLE_VERBOSE else "false",
     shell:
         """
-        bowtie2 -x {config[host_index]} -U {input.passed} -p {threads} | \
-        samtools view -Sb - -f4 > {output.bam}
+        set -euo pipefail
+        mkdir -p results/libraries/{wildcards.sample}/bowtie2
+        mkdir -p "$(dirname {log})"
+        if [ "{params.verbose}" = "true" ]; then
+          bowtie2 {params.quiet_arg} -x {config[host_index]} -U {input.passed} -p {threads} 2> >(tee -a {log} >&2) | \
+          samtools view -Sb - -f4 > {output.bam}
+        else
+          bowtie2 {params.quiet_arg} -x {config[host_index]} -U {input.passed} -p {threads} 2>> {log} | \
+          samtools view -Sb - -f4 > {output.bam}
+        fi
         """
 
 
@@ -2169,11 +2670,16 @@ def sample_pcrs(wc):
     return pcrs_for_sample(wc.sample)
 
 
+def sample_meta_pcrs(wc):
+    """PCRs of a bio sample that participate in metagenomics (skip_metagenomics=false)."""
+    return [p for p in pcrs_for_sample(wc.sample) if p in META_PCRS]
+
+
 rule merge_unaligned_fastq_per_sample:
     input:
         lambda wc: expand(
             "results/libraries/{pcr}/unaligned_fastq/{pcr}_unaligned.fastq.gz",
-            pcr=sample_pcrs(wc)
+            pcr=sample_meta_pcrs(wc),
         )
     output:
         # Keep merged unaligned FASTQ permanently so it can be reused by KrakenUniq,
@@ -2311,7 +2817,8 @@ rule parse_fastq_screen:
     output:
         "results/libraries/{sample}/fastq_screen/{sample}_best_species.txt"
     params:
-        exclude_human=True
+        exclude_human=True,
+        force_host_species=lambda wc: PCR_INFO.get(wc.sample, {}).get("force_host_species", ""),
     script:
         "scripts/parse_fastq_screen.py"
     
@@ -2319,9 +2826,9 @@ rule parse_fastq_screen:
 if ENABLE_HOPS:
 
     _hops_evalue_inputs = dict(
-        genus=expand("results/pathogen/{sample}/evalue/genus/{sample}_genus.csv", sample=BIO_SAMPLES),
-        species=expand("results/pathogen/{sample}/evalue/species/{sample}_species.csv", sample=BIO_SAMPLES),
-        pathogen=expand("results/pathogen/{sample}/evalue/pathogen/{sample}_pathogen.csv", sample=BIO_SAMPLES),
+        genus=expand("results/pathogen/{sample}/evalue/genus/{sample}_genus.csv", sample=META_BIOS),
+        species=expand("results/pathogen/{sample}/evalue/species/{sample}_species.csv", sample=META_BIOS),
+        pathogen=expand("results/pathogen/{sample}/evalue/pathogen/{sample}_pathogen.csv", sample=META_BIOS),
         config="config/config_hops_custom.txt",
     )
 
@@ -2329,18 +2836,18 @@ if ENABLE_HOPS:
         if HOPS_MALT_MMAP:
             rule hops_malt_parallel_mmap:
                 input:
-                    fastqs=[kraken_input_fastq_path(bio) for bio in BIO_SAMPLES],
+                    fastqs=[kraken_input_fastq_path(bio) for bio in META_BIOS],
                     config="config/config_hops_custom.txt",
                     script="scripts/run_parallel_malt.py",
                     evalue_gate=expand(
                         "results/pathogen/{sample}/evalue/pathogen/{sample}_pathogen.csv",
-                        sample=BIO_SAMPLES,
+                        sample=META_BIOS,
                     ),
                 output:
-                    done=expand(f"{HOPS_MALT_ROOT}/{{bio}}/.malt_done", bio=BIO_SAMPLES),
+                    done=expand(f"{HOPS_MALT_ROOT}/{{bio}}/.malt_done", bio=META_BIOS),
                 params:
                     malt_root=HOPS_MALT_ROOT,
-                    bio_samples=" ".join(BIO_SAMPLES),
+                    bio_samples=" ".join(META_BIOS),
                     parallel_jobs=HOPS_PARALLEL_JOBS,
                     threads_per_job=HOPS_THREADS_PER_JOB,
                     heap_gb=HOPS_HEAP_GB,
@@ -2374,7 +2881,7 @@ if ENABLE_HOPS:
                     # Scheduling gate: wait for cohort Kraken/E-value, not used by hops itself.
                     evalue_gate=expand(
                         "results/pathogen/{sample}/evalue/pathogen/{sample}_pathogen.csv",
-                        sample=BIO_SAMPLES,
+                        sample=META_BIOS,
                     ),
                 output:
                     done=f"{HOPS_MALT_ROOT}/{{bio}}/.malt_done",
@@ -2413,12 +2920,12 @@ if ENABLE_HOPS:
 
         rule hops_stage_rma:
             input:
-                malt_done=[hops_malt_done_path(b) for b in BIO_SAMPLES],
+                malt_done=[hops_malt_done_path(b) for b in META_BIOS],
                 script="scripts/stage_hops_rma.py",
             output:
-                [hops_staged_rma_path(b) for b in BIO_SAMPLES],
+                [hops_staged_rma_path(b) for b in META_BIOS],
             params:
-                bio_samples=" ".join(BIO_SAMPLES),
+                bio_samples=" ".join(META_BIOS),
                 malt_root=HOPS_MALT_ROOT,
                 rma_root=HOPS_RMA_ROOT,
             conda:
@@ -2437,7 +2944,7 @@ if ENABLE_HOPS:
 
         rule hops_maltex_post:
             input:
-                rma=[hops_staged_rma_path(b) for b in BIO_SAMPLES],
+                rma=[hops_staged_rma_path(b) for b in META_BIOS],
                 config="config/config_hops_custom.txt",
             output:
                 heatmap=HOPS_HEATMAP,
@@ -2466,7 +2973,7 @@ if ENABLE_HOPS:
         rule hops:
             input:
                 **_hops_evalue_inputs,
-                fq=[kraken_input_fastq_path(bio) for bio in BIO_SAMPLES],
+                fq=[kraken_input_fastq_path(bio) for bio in META_BIOS],
             output:
                 heatmap=HOPS_HEATMAP,
             params:
@@ -2509,16 +3016,16 @@ if ENABLE_HOPS:
 
 rule gather_sinks:
     input:
-        fastqs=[kraken_input_fastq_path(bio) for bio in BIO_SAMPLES],
+        fastqs=[kraken_input_fastq_path(bio) for bio in META_BIOS],
     output:
         sink_txt="results/metagenomics/decOM/p_sink.txt",
-        fof_files=expand("results/metagenomics/decOM/p_keys/{sample}.fof", sample=BIO_SAMPLES)
+        fof_files=expand("results/metagenomics/decOM/p_keys/{sample}.fof", sample=META_BIOS)
     run:
         import os
         os.makedirs("results/metagenomics/decOM/p_keys", exist_ok=True)
         missing = []
         with open(output.sink_txt, "w") as f_sink:
-            for sample in BIO_SAMPLES:
+            for sample in META_BIOS:
                 f_sink.write(sample + "\n")
                 fq_path = os.path.abspath(kraken_input_fastq_path(sample))
                 if not os.path.isfile(fq_path):
@@ -2535,7 +3042,7 @@ rule gather_sinks:
 rule decom_run:
     input:
         p_sink="results/metagenomics/decOM/p_sink.txt",
-        fof_files=expand("results/metagenomics/decOM/p_keys/{sample}.fof", sample=BIO_SAMPLES),
+        fof_files=expand("results/metagenomics/decOM/p_keys/{sample}.fof", sample=META_BIOS),
         wrapper="scripts/run_decom.py",
         # Wait for HOPS before decOM so parallel MALT jobs do not compete for RAM.
         **({"hops_done": HOPS_HEATMAP} if ENABLE_HOPS else {}),
@@ -2563,7 +3070,7 @@ rule decom_run:
 ## Krona plots removed (user no longer needs krona HTML outputs).
 rule krakenuniq_abundance_matrix:
     input:
-        reports = expand("results/metagenomics/krakenuniq/{sample}/{sample}_kraken-report.txt", sample=BIO_SAMPLES),
+        reports = expand("results/metagenomics/krakenuniq/{sample}/{sample}_kraken-report.txt", sample=META_BIOS),
         script1 = "scripts/krakenuniq_abundance_matrix.R",
         script2 = "scripts/plot_krakenuniq_abundance_matrix.R"
     output:
@@ -2654,7 +3161,8 @@ rule mark_duplicates_host:
     threads: MARKDUP_THREADS
     conda: "workflow/envs/picard.yaml"
     params:
-        dedup_tool=DEDUP_TOOL
+        dedup_tool=DEDUP_TOOL,
+        picard_quiet=PICARD_QUIET_ARG,
     shell:
         """
         if [ "{params.dedup_tool}" = "samtools" ]; then
@@ -2671,7 +3179,8 @@ rule mark_duplicates_host:
                 M={output.metrics} \
                 REMOVE_DUPLICATES=true \
                 ASSUME_SORTED=true \
-                VALIDATION_STRINGENCY=SILENT
+                VALIDATION_STRINGENCY=SILENT \
+                {params.picard_quiet}
         fi
         """
 rule index_dedup_bam_host:
@@ -3662,7 +4171,7 @@ rule qualimap_bamqc_mtdna_mapping_merged:
 ###----------------------------------------wrappers------------------------------------------------######################
 rule merge_pathogen_summaries:
     input:
-        summaries=expand("results/pathogen/{sample}/summary/{sample}_pathogen_summary.csv", sample=BIO_SAMPLES)
+        summaries=expand("results/pathogen/{sample}/summary/{sample}_pathogen_summary.csv", sample=AUTH_BIOS)
     output:
         excel="results/final/pathogen_summary_all_samples.xlsx"
     conda:
@@ -3683,7 +4192,7 @@ rule create_pathogen_heatmap:
         "scripts/create_pathogen_heatmap.py"
 
 # Create comprehensive summary Excel with all samples
-if HOST_MTDNA_ANALYSIS_ENABLED:
+if HOST_MTDNA_ANALYSIS_ENABLED and ENABLE_PATHOGEN_AUTHENTICATION:
     rule create_comprehensive_summary:
         input:
             host_mtdna="results/final/host_mtdna_summary_all_samples.xlsx",
@@ -3694,7 +4203,18 @@ if HOST_MTDNA_ANALYSIS_ENABLED:
             "workflow/envs/summary.yaml"
         script:
             "scripts/create_comprehensive_summary.py"
-else:
+elif HOST_MTDNA_ANALYSIS_ENABLED and not ENABLE_PATHOGEN_AUTHENTICATION:
+    rule create_comprehensive_summary:
+        input:
+            host_mtdna="results/final/host_mtdna_summary_all_samples.xlsx"
+        output:
+            excel="results/final/comprehensive_summary_all_samples.xlsx"
+        shell:
+            """
+            mkdir -p results/final
+            cp "{input.host_mtdna}" "{output.excel}"
+            """
+elif ENABLE_PATHOGEN_AUTHENTICATION:
     # Screening-only / pathogen-only mode: still produce a "comprehensive" spreadsheet
     # with basic sample/pathogen metrics, even if host mapping/QC is disabled.
     rule create_comprehensive_summary:
@@ -3706,6 +4226,33 @@ else:
             "workflow/envs/summary.yaml"
         script:
             "scripts/create_comprehensive_summary_pathogen_only.py"
+else:
+    # Host off + pathogen auth off (metagenomics-only or trim/host-id only)
+    rule create_comprehensive_summary:
+        output:
+            excel="results/final/comprehensive_summary_all_samples.xlsx"
+        conda:
+            "workflow/envs/summary.yaml"
+        params:
+            note=(
+                "metagenomics_only"
+                if ENABLE_METAGENOMICS
+                else "pathogen_authentication_and_metagenomics_skipped"
+            ),
+            samples=" ".join(BIO_SAMPLES),
+        shell:
+            r"""
+            python - <<'PY'
+            import os
+            import pandas as pd
+            samples = '''{params.samples}'''.split()
+            note = '''{params.note}'''
+            os.makedirs("results/final", exist_ok=True)
+            pd.DataFrame({{"sample": samples, "note": note}}).to_excel(
+                "{output.excel}", index=False
+            )
+            PY
+            """
 
 # Generate per-sample PDF reports
 rule generate_sample_report:
@@ -4003,7 +4550,7 @@ rule pathogen_report:
 rule generate_all_pathogen_reports:
     input:
         mapping_complete="results/workflow/pathogen_mapping_complete.txt",
-        pathogen_summaries=expand("results/pathogen/{sample}/summary/{sample}_pathogen_summary.csv", sample=BIO_SAMPLES),
+        pathogen_summaries=expand("results/pathogen/{sample}/summary/{sample}_pathogen_summary.csv", sample=AUTH_BIOS),
         pdfs=pathogen_report_pdfs_from_checkpoint,
     output:
         touch("results/workflow/pathogen_reports_complete.txt")
@@ -4023,8 +4570,23 @@ rule write_run_manifest:
     This is intended for paper supplementary information and for long-term reuse.
     """
     input:
-        # Ensure the workflow ran far enough that the checkpoint produced targets.
-        "results/workflow/pathogen_reports_complete.txt",
+        # Barrier: wait until the farthest enabled stage completes.
+        *(
+            ["results/workflow/pathogen_reports_complete.txt"]
+            if ENABLE_PATHOGEN_AUTHENTICATION
+            else (
+                ["results/workflow/metagenomics_screening_cohort_ready.json"]
+                if ENABLE_METAGENOMICS
+                else (
+                    ["results/final/host_mtdna_summary_all_samples.xlsx"]
+                    if HOST_MTDNA_ANALYSIS_ENABLED
+                    else expand(
+                        "results/libraries/{sample}/fastq_screen/{sample}_best_species.txt",
+                        sample=SAMPLES,
+                    )
+                )
+            )
+        ),
         "config/config.yaml",
         "config/samples.tsv",
         "config/Pathogen_spreadsheet.csv",
@@ -4051,8 +4613,25 @@ if BUILD_RESULTS_CATALOG:
         Canonical paths: results/libraries/, results/samples/, results/host/, results/pools/unaligned_fastq/, results/pathogen/, results/metagenomics/, results/final/, results/workflow/.
         """
         input:
-            pathogen_complete="results/workflow/pathogen_mapping_complete.txt",
-            manifest="results/workflow/pathogen_targets.manifest.json",
+            *(
+                [
+                    "results/workflow/pathogen_mapping_complete.txt",
+                    "results/workflow/pathogen_targets.manifest.json",
+                ]
+                if ENABLE_PATHOGEN_AUTHENTICATION
+                else (
+                    ["results/workflow/metagenomics_screening_cohort_ready.json"]
+                    if ENABLE_METAGENOMICS
+                    else (
+                        ["results/final/host_mtdna_summary_all_samples.xlsx"]
+                        if HOST_MTDNA_ANALYSIS_ENABLED
+                        else expand(
+                            "results/libraries/{sample}/adapter_removal/{sample}.collapsed.gz",
+                            sample=SAMPLES,
+                        )
+                    )
+                )
+            ),
         output:
             catalog="results/final/output_catalog.tsv",
         params:
@@ -4088,7 +4667,7 @@ if ENABLE_HOPS:
     rule calculate_pathogen_detection_scores:
         input:
             # E-Score results (already filtered by user thresholds)
-            escore_files = expand("results/pathogen/{sample}/evalue/pathogen/{sample}_pathogen.csv", sample=BIO_SAMPLES),
+            escore_files = expand("results/pathogen/{sample}/evalue/pathogen/{sample}_pathogen.csv", sample=META_BIOS),
             # Hops results
             hops_results = "results/metagenomics/hops/maltExtract/heatmap_overview_Wevid.tsv",
             # BWA / damageprofiler results for the checkpoint-selected pathogens
@@ -4109,7 +4688,7 @@ if ENABLE_HOPS:
                 for sample, ps in pathogen_pairs_from_checkpoint()
             ],
             # Comparison results (for k-mer ranking)
-            comparison_results = expand("results/pathogen/{sample}/comparison/{sample}_comparison.tsv", sample=BIO_SAMPLES)
+            comparison_results = expand("results/pathogen/{sample}/comparison/{sample}_comparison.tsv", sample=META_BIOS)
         output:
             scores_matrix = "results/metagenomics/pathogen_detection/detection_scores_matrix.csv",
             scores_heatmap = "results/metagenomics/pathogen_detection/detection_scores_heatmap.pdf",
@@ -4125,9 +4704,17 @@ if ENABLE_HOPS:
 rule generate_pipeline_report:
     input:
         adapter_removal=expand("results/libraries/{sample}/adapter_removal/{sample}.collapsed.gz", sample=SAMPLES),
-        kraken_reports=expand("results/metagenomics/krakenuniq/{sample}/{sample}_kraken-report.txt", sample=BIO_SAMPLES),
-        evalue_files=expand("results/pathogen/{sample}/evalue/pathogen/{sample}_pathogen.csv", sample=BIO_SAMPLES),
-        pathogen_complete="results/workflow/pathogen_mapping_complete.txt",
+        *(
+            expand("results/metagenomics/krakenuniq/{sample}/{sample}_kraken-report.txt", sample=META_BIOS)
+            + expand("results/pathogen/{sample}/evalue/pathogen/{sample}_pathogen.csv", sample=META_BIOS)
+            if ENABLE_METAGENOMICS
+            else []
+        ),
+        *(
+            ["results/workflow/pathogen_mapping_complete.txt"]
+            if ENABLE_PATHOGEN_AUTHENTICATION
+            else []
+        ),
         *(
             expand("results/libraries/{sample}/host_mapping/{sample}.dedup.bam", sample=SAMPLES)
             + expand("results/libraries/{sample}/mtdna_mapping/{sample}.dedup.bam", sample=SAMPLES)
@@ -4158,7 +4745,7 @@ if ENABLE_HOPS:
         input:
             scores_matrix = "results/metagenomics/pathogen_detection/detection_scores_matrix.csv",
             detailed_scores = "results/metagenomics/pathogen_detection/detailed_scores.csv",
-            comparison_files = expand("results/pathogen/{sample}/comparison/{sample}_comparison.tsv", sample=BIO_SAMPLES),
+            comparison_files = expand("results/pathogen/{sample}/comparison/{sample}_comparison.tsv", sample=META_BIOS),
             hops_results = "results/metagenomics/hops/maltExtract/heatmap_overview_Wevid.tsv",
             abundance_matrix = "results/metagenomics/kraken_abundance/krakenuniq_abundance_matrix_absolute.csv"
         output:
@@ -4179,7 +4766,7 @@ if ENABLE_HOPS:
         input:
             scores_matrix = "results/metagenomics/pathogen_detection/detection_scores_matrix.csv",
             detailed_scores = "results/metagenomics/pathogen_detection/detailed_scores.csv",
-            comparison_files = expand("results/pathogen/{sample}/comparison/{sample}_comparison.tsv", sample=BIO_SAMPLES),
+            comparison_files = expand("results/pathogen/{sample}/comparison/{sample}_comparison.tsv", sample=META_BIOS),
             abundance_matrix = "results/metagenomics/kraken_abundance/krakenuniq_abundance_matrix_absolute.csv"
         output:
             multi_method = "results/final/publication_figures/multi_method_comparison.png",

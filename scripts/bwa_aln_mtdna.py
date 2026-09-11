@@ -35,6 +35,7 @@ def _ensure_aligner_utils_path():
 
 _ensure_aligner_utils_path()
 from aligner_ref_utils import resolve_bowtie2_prefix_and_fasta, resolve_bwa_database_prefix
+from pigsti_verbosity import bash_stderr_redirect, bowtie2_quiet_args, vprint
 
 # Read species
 with open(species_file) as f:
@@ -211,22 +212,26 @@ if host_aligner == "bowtie2":
         "--rg",
         "PL:ILLUMINA",
     ]
+    bowtie2_cmd[1:1] = bowtie2_quiet_args(config)
     if lb:
         bowtie2_cmd.extend(["--rg", f"LB:{lb}"])
-    print(f"Running bowtie2 -> samtools (log: {log_file})")
+    vprint(config, f"Running bowtie2 -> samtools (log: {log_file})")
     run_bowtie2_pipe_to_bam(bowtie2_cmd, log_file, threads, output_file)
     cmd = None
 else:
     # BWA mtDNA mapping (original behaviour)
+    bwa_log = output_file.replace(".bam", "_bwa.log")
+    err_redir = bash_stderr_redirect(bwa_log, config)
     sai_file = output_file.replace(".bam", ".sai")
     cmd = (
-        f"bwa aln -l 1024 -n 0.01 -o 2 -t {threads} {index_prefix} {reads_file} > {sai_file} && "
-        f"bwa samse -r '@RG\\tID:{sample}_host\\tSM:{sample}\\tPL:ILLUMINA' {index_prefix} {sai_file} {reads_file} | "
+        f"mkdir -p \"$(dirname {bwa_log})\"; "
+        f"bwa aln -l 1024 -n 0.01 -o 2 -t {threads} {index_prefix} {reads_file} > {sai_file} {err_redir} && "
+        f"bwa samse -r '@RG\\tID:{sample}_host\\tSM:{sample}\\tPL:ILLUMINA' {index_prefix} {sai_file} {reads_file} {err_redir} | "
         f"samtools view -@ {threads} -F 4 -b -o {output_file} -"
     )
 
 if cmd is not None:
-    print(f"Running command:\n{cmd}")
+    vprint(config, f"Running command:\n{cmd}")
     try:
         subprocess.run(
             ["bash", "-c", f"set -euo pipefail; {cmd}"],

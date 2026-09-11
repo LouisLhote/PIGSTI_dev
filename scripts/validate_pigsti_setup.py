@@ -155,37 +155,56 @@ def main() -> int:
             errors.append(f"Pathogen_spreadsheet.csv missing columns: {sorted(missing)}")
 
     kraken_db = str(cfg.get("kraken_db", "")).strip()
-    if not kraken_db:
-        errors.append("config key 'kraken_db' is empty")
-    elif not _dir_ok(kraken_db):
-        errors.append(
-            f"config key 'kraken_db' must be an existing KrakenUniq database directory: {kraken_db}"
-        )
-
     host_index = str(cfg.get("host_index", "")).strip()
-    if not host_index:
-        errors.append("config key 'host_index' is empty (Bowtie2 chimera index PREFIX for bowtie2_unaligned)")
-    elif not _bowtie2_index_ok(host_index):
-        errors.append(
-            "config key 'host_index' — Bowtie2 index not found. "
-            f"Expect files {host_index}.1.bt2 or {host_index}.1.bt2l on disk. "
-            "Example: .../multi/chimera.1.bt2l -> host_index: .../multi/chimera "
-            "(there is no directory named chimera; only the index prefix)."
+    enable_metagenomics = bool(cfg.get("enable_metagenomics", True))
+    enable_pathogen_authentication = bool(cfg.get("enable_pathogen_authentication", True))
+    if not enable_metagenomics and enable_pathogen_authentication:
+        warnings.append(
+            "enable_metagenomics=false forces enable_pathogen_authentication=false "
+            "(pathogen auth requires Kraken/E-value candidates)"
         )
+        enable_pathogen_authentication = False
 
-    host_aligner = str(cfg.get("host_aligner", "bwa")).strip().lower()
-    if host_aligner == "bowtie2":
-        _check_bowtie2_with_fasta_fallback(
-            cfg, "bowtie2_indices", "bwa_indices", errors, warnings
-        )
-        _check_bowtie2_with_fasta_fallback(
-            cfg, "bowtie2_mtDNA_indices", "mtDNA_indices", errors, warnings
-        )
+    if enable_metagenomics:
+        if not kraken_db:
+            errors.append("config key 'kraken_db' is empty")
+        elif not _dir_ok(kraken_db):
+            errors.append(
+                f"config key 'kraken_db' must be an existing KrakenUniq database directory: {kraken_db}"
+            )
+
+        if not host_index:
+            errors.append(
+                "config key 'host_index' is empty (Bowtie2 chimera index PREFIX for bowtie2_unaligned)"
+            )
+        elif not _bowtie2_index_ok(host_index):
+            errors.append(
+                "config key 'host_index' — Bowtie2 index not found. "
+                f"Expect files {host_index}.1.bt2 or {host_index}.1.bt2l on disk. "
+                "Example: .../multi/chimera.1.bt2l -> host_index: .../multi/chimera "
+                "(there is no directory named chimera; only the index prefix)."
+            )
     else:
-        _check_index_dict(cfg, "bwa_indices", errors, bowtie2=False)
-        _check_index_dict(cfg, "mtDNA_indices", errors, bowtie2=False)
+        if kraken_db and not _dir_ok(kraken_db):
+            warnings.append(f"enable_metagenomics=false; ignoring kraken_db path: {kraken_db}")
+        if host_index and not _bowtie2_index_ok(host_index):
+            warnings.append(f"enable_metagenomics=false; ignoring host_index path: {host_index}")
 
-    if cfg.get("enable_sexing", True):
+    pathogen_screening_only = bool(cfg.get("pathogen_screening_only", False))
+    host_aligner = str(cfg.get("host_aligner", "bwa")).strip().lower()
+    if not pathogen_screening_only:
+        if host_aligner == "bowtie2":
+            _check_bowtie2_with_fasta_fallback(
+                cfg, "bowtie2_indices", "bwa_indices", errors, warnings
+            )
+            _check_bowtie2_with_fasta_fallback(
+                cfg, "bowtie2_mtDNA_indices", "mtDNA_indices", errors, warnings
+            )
+        else:
+            _check_index_dict(cfg, "bwa_indices", errors, bowtie2=False)
+            _check_index_dict(cfg, "mtDNA_indices", errors, bowtie2=False)
+
+    if cfg.get("enable_sexing", True) and not pathogen_screening_only:
         sexing_candidates = (
             os.path.join("scripts", "sexing", "sexing_residual_method.R"),
             os.path.join("scripts", "sexing_residual_method.R"),
@@ -196,7 +215,7 @@ def main() -> int:
                 f"(tried: {', '.join(sexing_candidates)})"
             )
 
-    if cfg.get("enable_hops"):
+    if cfg.get("enable_hops") and enable_metagenomics:
         if not cfg.get("hops_malt_index"):
             warnings.append("enable_hops=true but hops_malt_index not set")
         if cfg.get("hops_parallel"):
@@ -206,11 +225,15 @@ def main() -> int:
             per_job = cfg.get("hops_threads_per_job")
             if per_job is not None and int(per_job) < 1:
                 errors.append("hops_threads_per_job must be >= 1 when set")
+    elif cfg.get("enable_hops") and not enable_metagenomics:
+        warnings.append("enable_hops=true ignored because enable_metagenomics=false")
 
-    if cfg.get("enable_decom"):
+    if cfg.get("enable_decom") and enable_metagenomics:
         src = cfg.get("decOM_sources", "")
         if not src or not os.path.isdir(str(src)):
             errors.append(f"enable_decom=true but decOM_sources missing or not a directory: {src}")
+    elif cfg.get("enable_decom") and not enable_metagenomics:
+        warnings.append("enable_decom=true ignored because enable_metagenomics=false")
 
     for w in warnings:
         print(f"WARNING: {w}", file=sys.stderr)
