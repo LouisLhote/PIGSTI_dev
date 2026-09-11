@@ -482,11 +482,13 @@ if ENABLE_PATHOGEN_AUTHENTICATION and len(AUTH_BIOS) < len(META_BIOS):
         f"{len(AUTH_BIOS)}/{len(META_BIOS)} screened sample(s)",
         file=sys.stderr,
     )
-_forced = [s for s in SAMPLES if PCR_INFO[s].get("force_host_species")]
-if _forced:
+FORCE_HOST_PCRS = [s for s in SAMPLES if PCR_INFO[s].get("force_host_species")]
+FQS_PCRS = [s for s in SAMPLES if s not in set(FORCE_HOST_PCRS)]
+if FORCE_HOST_PCRS:
     print(
-        f"[PIGSTI] force_host_species set for {len(_forced)} library(ies) "
-        "(FastQ Screen still runs; alignment uses forced species)",
+        f"[PIGSTI] force_host_species set for {len(FORCE_HOST_PCRS)} library(ies) "
+        f"— FastQ Screen skipped for those; alignment uses forced species "
+        f"({len(FQS_PCRS)} library(ies) still screened)",
         file=sys.stderr,
     )
 
@@ -2463,6 +2465,27 @@ rule generate_fastq_screen_conf:
                 f.write(f"DATABASE\t{name}\t{path}\tBOWTIE2\n")
 
 
+# When force_host_species is set, skip FastQ Screen and write species + stub reports.
+rule force_host_skip_fastq_screen:
+    output:
+        html="results/libraries/{sample}/fastq_screen/{sample}.collapsed_screen.html",
+        txt="results/libraries/{sample}/fastq_screen/{sample}.collapsed_screen.txt",
+        run_mode="results/libraries/{sample}/fastq_screen/{sample}_fastq_screen_run_mode.txt",
+        best="results/libraries/{sample}/fastq_screen/{sample}_best_species.txt",
+    params:
+        species=lambda wc: PCR_INFO[wc.sample]["force_host_species"],
+    wildcard_constraints:
+        sample=_wc_alt(FORCE_HOST_PCRS),
+    shell:
+        r"""
+        mkdir -p results/libraries/{wildcards.sample}/fastq_screen
+        echo "# FastQ Screen skipped: force_host_species={params.species}" > {output.txt}
+        printf '%s\n' "<html><body><p>FastQ Screen skipped (force_host_species={params.species})</p></body></html>" > {output.html}
+        echo "pass=skipped reason=force_host_species species={params.species}" > {output.run_mode}
+        printf '%s\n' "{params.species}" > {output.best}
+        """
+
+
 # FastQ Screen on AdapterRemoval collapsed reads (before PRINSEQ); host mapping uses the same collapsed FASTQ.
 rule fastq_screen:
     input:
@@ -2475,6 +2498,8 @@ rule fastq_screen:
     params:
         full_rescreen=1 if FASTQ_SCREEN_FULL_RESCREEN else 0,
         min_one_hit=FASTQ_SCREEN_MIN_ONE_HIT,
+    wildcard_constraints:
+        sample=_wc_alt(FQS_PCRS),
     threads: 4
     conda:
         "workflow/envs/fastq_screen.yaml"
@@ -2819,6 +2844,8 @@ rule parse_fastq_screen:
     params:
         exclude_human=True,
         force_host_species=lambda wc: PCR_INFO.get(wc.sample, {}).get("force_host_species", ""),
+    wildcard_constraints:
+        sample=_wc_alt(FQS_PCRS),
     script:
         "scripts/parse_fastq_screen.py"
     

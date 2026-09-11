@@ -66,7 +66,7 @@ python scripts/validate_pigsti_setup.py --config config/config.yaml --samples co
 
 | File | Required columns / content |
 |------|----------------------------|
-| **`config/samples.tsv`** | Tab-separated. **`sample`** (bio ID), **`pcr`** (library ID; optional — defaults to `sample`), **`r1`** (and **`r2`** if paired-end). Paths must exist on disk. Optional metadata: `RGLB`, `sequencing_run`, `source` (`LOCAL` / `ENA`). Optional per-library flags (blank = inherit config / FastQ Screen): **`skip_trimming`**, **`skip_metagenomics`** (alias `skip_meta`), **`skip_pathogen_authentication`** (aliases `skip_pathogen` / `skip_pathogen_auth`), **`force_host_species`** (must match a key in `bwa_indices` / `bowtie2_indices`; FastQ Screen still runs for QC). |
+| **`config/samples.tsv`** | Tab-separated. **`sample`** (bio ID), **`pcr`** (library ID; optional — defaults to `sample`), **`r1`** (and **`r2`** if paired-end). Paths must exist on disk. Optional metadata: `RGLB`, `sequencing_run`, `source` (`LOCAL` / `ENA`). Optional per-library flags (blank = inherit config / FastQ Screen): **`skip_trimming`**, **`skip_metagenomics`** (alias `skip_meta`), **`skip_pathogen_authentication`** (aliases `skip_pathogen` / `skip_pathogen_auth`), **`force_host_species`** (must match a key in `bwa_indices` / `bowtie2_indices`; FastQ Screen is skipped for that library). |
 | **`config/Pathogen_spreadsheet.csv`** | **`Krakenuniq name`**, **`Hops name`**, **`bwa index`** (pathogen reference FASTA or index path). One row per pathogen you may map. |
 | **`config/config.yaml`** | See mandatory keys below. |
 
@@ -114,7 +114,7 @@ Optional — **omit the columns entirely for a normal full run** (same as blank 
 | `skip_trimming` | Stage `r1` as collapsed.gz (skip AdapterRemoval/cutadapt for that library) |
 | `skip_metagenomics` / `skip_meta` | Skip PRINSEQ → Kraken/E-value (± HOPS/decOM) for that library |
 | `skip_pathogen_authentication` / `skip_pathogen` | Skip pathogen mapping/auth for that bio when its libraries skip |
-| `force_host_species` | Force host/mtDNA index key (e.g. `Pig`). FastQ Screen still runs; `…_best_species.txt` overwritten |
+| `force_host_species` | Force host/mtDNA index key (e.g. `Pig`). Skips FastQ Screen for that library; writes `…_best_species.txt` directly |
 
 ### Stage targets (Snakemake)
 

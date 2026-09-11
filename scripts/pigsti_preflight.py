@@ -122,7 +122,7 @@ def build_report(cfg: dict, libs: list[dict]) -> str:
         f"skip meta: {n_skip_meta} | force_host_species: {n_force}"
     )
     lines.append(
-        "Notes: FastQ Screen still runs when force_host_species is set; "
+        "Notes: FastQ Screen is skipped when force_host_species is set; "
         "alignment uses the forced index key."
     )
     return "\n".join(lines) + "\n"
